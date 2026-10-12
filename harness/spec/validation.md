@@ -196,7 +196,8 @@ Apply these allocation rules before running a new case:
 - enables the core test and example targets;
 - enables the congestion-control and QPACK compatibility symbols required by
   the existing test and example targets;
-- disables optional MoQ support; and
+- keeps optional MoQ support disabled unless the `moq` feature profile is
+  selected; and
 - compiles the configured targets;
 - builds BoringSSL from an already-present local source checkout when the
   default static libraries are missing; and

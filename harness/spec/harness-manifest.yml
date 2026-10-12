@@ -211,6 +211,24 @@ modules:
           level: targeted
           hints: [qpack]
 
+  moq:
+    paths:
+      - moq/*
+    read:
+      - harness/spec/architecture.md
+      - harness/spec/validation.md
+    features:
+      moq:
+        paths:
+          - moq/*
+        feature_flags:
+          - XQC_ENABLE_MOQ=1
+        validation:
+          level: targeted
+          hints: [moq, subscribe, gateway]
+    validation:
+      level: targeted
+
   tls:
     paths:
       - src/tls/*
