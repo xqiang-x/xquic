@@ -284,3 +284,57 @@ Evidence:
 - `harness/spec/validation.md`
 - `harness/spec/harness-manifest.yml`
 - `harness/scripts/harness_manifest_check.rb`
+
+## ADR-H008: Republish External Server Frames Through A Separate Gateway
+
+Status: Accepted
+
+Date: 2026-10-12
+
+Context:
+
+- A downstream MoQ relay must republish media frames assembled by an external
+  server (the tj_rtc SFU) and serve MoQ subscribers over QUIC with the
+  `moq-quic` ALPN.
+- Linking the MoQ module into the external server process would couple that
+  server's build to optional MoQ code and dependencies.
+- The external server exposes assembled frames over a Unix-domain-socket Frame
+  IPC whose defining header lives outside this repository.
+
+Decision:
+
+- Add `moq_gateway` as a standalone executable under `moq/demo/` that consumes
+  the Frame IPC as a client and serves MoQ subscribers; no MoQ library surface
+  changes.
+- Carry the IPC contract as an independent C copy inside the gateway
+  (`xqc_moq_gateway_frame_ipc.h`) and lock it with contract unit tests that
+  assert the recorded constants, round trips, boundary rejections, and byte
+  order.
+- Derive IPC `SUB`/`UNSUB` from per-stream downstream subscription refcounts,
+  gate fan-out on a cached key frame, and throttle subscriber keyframe
+  requests per stream before forwarding them as IPC `PLI`.
+- Keep the gateway inside the MoQ feature profile (`XQC_ENABLE_MOQ`) and
+  register its unit tests in the `moq` manifest module.
+
+Consequences:
+
+- The relay reconnects and restarts independently of the media server; a
+  dropped IPC connection resets stream state and re-subscribes on reconnect.
+- No subscriber traffic reaches the server while no MoQ subscriber is active
+  (refs 0 sends `UNSUB`).
+- IPC contract changes require updating both copies; the gateway unit tests
+  fail closed when the local copy drifts from the recorded wire constants.
+
+Update triggers:
+
+- Revisit if the Frame IPC contract changes or if the relay moves in-process.
+
+Evidence:
+
+- `moq/demo/xqc_moq_gateway.c`
+- `moq/demo/xqc_moq_gateway_frame_ipc.h`
+- `moq/demo/xqc_moq_gateway_feed.c`
+- `moq/demo/xqc_moq_gateway_ipc.c`
+- `tests/unittest/xqc_moq_gateway_test.c`
+- `harness/spec/harness-manifest.yml`
+- `harness/spec/architecture.md`

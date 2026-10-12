@@ -48,6 +48,7 @@
 #include "xqc_vn_test.h"
 #include "xqc_frame_type_bit_test.h"
 #include "xqc_flow_ctl_test.h"
+#include "xqc_moq_gateway_test.h"
 
 static int xqc_init_suite(void) { return 0; }
 static int xqc_clean_suite(void) { return 0; }
@@ -574,6 +575,16 @@ main(int argc, char *argv[])
                         xqc_test_alpn_server_cb_propagates_error)
         || !CU_add_test(pSuite, "xqc_test_alpn_client_handshake_no_alpn",
                         xqc_test_alpn_client_handshake_no_alpn)
+#if defined(XQC_ENABLE_MOQ) && !defined(_WIN32)
+        || !CU_add_test(pSuite, "xqc_test_moq_gateway_frame_map",
+                        xqc_test_moq_gateway_frame_map)
+        || !CU_add_test(pSuite, "xqc_test_moq_gateway_params_merge",
+                        xqc_test_moq_gateway_params_merge)
+        || !CU_add_test(pSuite, "xqc_test_moq_gateway_fanout",
+                        xqc_test_moq_gateway_fanout)
+        || !CU_add_test(pSuite, "xqc_test_moq_gateway_ipc_client",
+                        xqc_test_moq_gateway_ipc_client)
+#endif
         /* ADD TESTS HERE */)
     {
         CU_cleanup_registry();

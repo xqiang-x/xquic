@@ -223,8 +223,16 @@ modules:
           - moq/*
         feature_flags:
           - XQC_ENABLE_MOQ=1
+        read:
+          - harness/spec/architecture.md
+          - tests/unittest/xqc_moq_gateway_test.c
         validation:
           level: targeted
+          unit:
+            - xqc_test_moq_gateway_frame_map
+            - xqc_test_moq_gateway_params_merge
+            - xqc_test_moq_gateway_fanout
+            - xqc_test_moq_gateway_ipc_client
           hints: [moq, subscribe, gateway]
     validation:
       level: targeted
