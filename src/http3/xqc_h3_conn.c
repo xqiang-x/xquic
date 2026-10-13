@@ -4,6 +4,7 @@
 
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ctx.h"
+#include "src/http3/xqc_webtransport.h"
 
 #include "src/transport/xqc_engine.h"
 #include "src/transport/xqc_stream.h"
@@ -17,6 +18,9 @@ const xqc_h3_conn_settings_t default_local_h3_conn_settings = {
     .qpack_blocked_streams          = XQC_QPACK_MAX_BLOCK_STREAM,
     .qpack_enc_max_table_capacity   = XQC_QPACK_MAX_TABLE_CAPACITY,
     .qpack_dec_max_table_capacity   = XQC_QPACK_MAX_TABLE_CAPACITY,
+    .enable_connect_protocol        = 0,
+    .h3_datagram                    = 0,
+    .webtransport_max_sessions      = 0,
 #ifdef XQC_COMPAT_DUPLICATE
     .qpack_compat_duplicate         = XQC_FALSE,
 #endif
@@ -28,6 +32,9 @@ const xqc_h3_conn_settings_t default_peer_h3_conn_settings = {
     .qpack_blocked_streams          = XQC_H3_SETTINGS_UNSET,
     .qpack_enc_max_table_capacity   = XQC_H3_SETTINGS_UNSET,
     .qpack_dec_max_table_capacity   = XQC_H3_SETTINGS_UNSET,
+    .enable_connect_protocol        = XQC_H3_SETTINGS_UNSET,
+    .h3_datagram                    = XQC_H3_SETTINGS_UNSET,
+    .webtransport_max_sessions      = XQC_H3_SETTINGS_UNSET,
 #ifdef XQC_COMPAT_DUPLICATE
     .qpack_compat_duplicate         = XQC_FALSE,
 #endif
@@ -424,6 +431,21 @@ xqc_h3_conn_init_settings(xqc_h3_conn_t *h3c)
     h3c->local_h3_conn_settings = *local_settings;
     h3c->peer_h3_conn_settings = default_peer_h3_conn_settings;
 
+    if (h3c->conn->engine->config->enable_webtransport) {
+        /*
+         * draft-ietf-webtrans-http3-07 Sections 3.1/3.2: advertise
+         * WebTransport support; the server additionally sends
+         * SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 (the writer pairs it
+         * with the MAX_SESSIONS entry).
+         */
+        h3c->local_h3_conn_settings.enable_connect_protocol = 1;
+        h3c->local_h3_conn_settings.h3_datagram = 1;
+        h3c->local_h3_conn_settings.webtransport_max_sessions =
+            h3c->conn->engine->config->webtransport_max_sessions > 0
+            ? h3c->conn->engine->config->webtransport_max_sessions
+            : XQC_H3_WT_DEFAULT_MAX_SESSIONS;
+    }
+
     return XQC_OK;
 }
 
@@ -516,6 +538,15 @@ xqc_h3_conn_create(xqc_connection_t *conn, void *user_data)
     xqc_qpack_set_compat_dup(h3c->qpack, h3c->local_h3_conn_settings.qpack_compat_duplicate);
 #endif
 
+    /* WebTransport session layer */
+    if (conn->engine->config->enable_webtransport) {
+        h3c->wt = xqc_wt_conn_create(h3c);
+        if (h3c->wt == NULL) {
+            xqc_log(h3c->log, XQC_LOG_ERROR, "|create webtransport conn failed");
+            goto fail;
+        }
+    }
+
     xqc_log_event(h3c->log, HTTP_PARAMETERS_SET, h3c, XQC_LOG_LOCAL_EVENT);
 
     /* creation callback */
@@ -551,6 +582,11 @@ xqc_h3_conn_destroy(xqc_h3_conn_t *h3_conn)
 
     xqc_h3_conn_destroy_blocked_stream_list(h3_conn);
     xqc_qpack_destroy(h3_conn->qpack);
+
+    if (h3_conn->wt) {
+        xqc_wt_conn_destroy(h3_conn->wt);
+        h3_conn->wt = NULL;
+    }
 
     xqc_log(h3_conn->log, XQC_LOG_DEBUG, "|success|");
     xqc_free(h3_conn);
@@ -748,6 +784,70 @@ xqc_h3_conn_on_settings_entry_received(uint64_t identifier, uint64_t value, void
             xqc_log(h3c->log, XQC_LOG_ERROR, "|set qpack blocked stream error|ret:%d", ret);
             return ret;
         }
+        break;
+
+    case XQC_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL:
+        /*
+         * RFC 9220 Section 3: the value MUST be 0 or 1, otherwise the
+         * connection is terminated with H3_SETTINGS_ERROR.
+         */
+        if (value > 1) {
+            xqc_log(h3c->log, XQC_LOG_ERROR,
+                    "|invalid SETTINGS_ENABLE_CONNECT_PROTOCOL|value:%ui|", value);
+            XQC_H3_CONN_ERR(h3c, H3_SETTINGS_ERROR, -XQC_H3_SETTING_ERROR);
+            return -XQC_H3_SETTING_ERROR;
+        }
+        h3c->peer_h3_conn_settings.enable_connect_protocol = value;
+        break;
+
+    case XQC_H3_SETTINGS_H3_DATAGRAM:
+        /*
+         * RFC 9297 Section 2.1.1: the value MUST be 0 or 1, otherwise
+         * the connection is terminated with H3_SETTINGS_ERROR.
+         */
+        if (value > 1) {
+            xqc_log(h3c->log, XQC_LOG_ERROR,
+                    "|invalid SETTINGS_H3_DATAGRAM|value:%ui|", value);
+            XQC_H3_CONN_ERR(h3c, H3_SETTINGS_ERROR, -XQC_H3_SETTING_ERROR);
+            return -XQC_H3_SETTING_ERROR;
+        }
+        h3c->peer_h3_conn_settings.h3_datagram = value;
+        break;
+
+    case XQC_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS:
+        h3c->peer_h3_conn_settings.webtransport_max_sessions = value;
+        break;
+
+    case XQC_H3_SETTINGS_WEBTRANSPORT_DRAFT00:
+        /*
+         * draft-ietf-webtrans-http3-02 Section 3: boolean enable flag
+         * sent by draft-02 peers (stock Chrome). The stream and datagram
+         * framing is identical to draft-07, so only the value range is
+         * checked here.
+         */
+        if (value > 1) {
+            xqc_log(h3c->log, XQC_LOG_ERROR,
+                    "|invalid SETTINGS_WEBTRANSPORT_DRAFT00|value:%ui|", value);
+            XQC_H3_CONN_ERR(h3c, H3_SETTINGS_ERROR, -XQC_H3_SETTING_ERROR);
+            return -XQC_H3_SETTING_ERROR;
+        }
+        xqc_log(h3c->log, XQC_LOG_DEBUG,
+                "|peer webtransport draft-02 support|value:%ui|", value);
+        break;
+
+    case XQC_H3_SETTINGS_H3_DATAGRAM_DRAFT04:
+        /*
+         * draft-ietf-masque-h3-datagram-04: boolean flag used by draft-02
+         * WebTransport peers; same on-wire datagram framing as RFC 9297.
+         */
+        if (value > 1) {
+            xqc_log(h3c->log, XQC_LOG_ERROR,
+                    "|invalid SETTINGS_H3_DATAGRAM_DRAFT04|value:%ui|", value);
+            XQC_H3_CONN_ERR(h3c, H3_SETTINGS_ERROR, -XQC_H3_SETTING_ERROR);
+            return -XQC_H3_SETTING_ERROR;
+        }
+        xqc_log(h3c->log, XQC_LOG_DEBUG,
+                "|peer h3 datagram draft-04 support|value:%ui|", value);
         break;
 
     case XQC_H3_SETTINGS_H2_ENABLE_PUSH:

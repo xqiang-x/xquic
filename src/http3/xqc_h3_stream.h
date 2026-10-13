@@ -31,6 +31,15 @@ typedef enum {
     XQC_H3_STREAM_TYPE_REQUEST          = 0x10,
     XQC_H3_STREAM_TYPE_BYTESTEAM        = 0x20,
 
+    /*
+     * WebTransport data streams (draft-ietf-webtrans-http3-07 Sections 4.1
+     * and 4.2). The concrete value is the wire stream type of a WebTransport
+     * uni stream, so received uni streams match it without translation;
+     * bidi streams and locally created streams share the same type because
+     * the dispatch is done through h3 stream's wt_stream context.
+     */
+    XQC_H3_STREAM_TYPE_WT               = 0x54,
+
     /* reserved stream type or others */
     XQC_H3_STREAM_TYPE_UNKNOWN          = 0xFFFFFFFFFFFFFFFFull,
 } xqc_h3_stream_type_t;
@@ -111,6 +120,13 @@ typedef struct xqc_h3_stream_s {
       xqc_h3_request_t               *h3r;
       xqc_h3_ext_bytestream_t        *h3_ext_bs;
     };
+
+    /*
+     * WebTransport stream context (draft-ietf-webtrans-http3-07 Sections
+     * 4.1/4.2), non-NULL only on WebTransport data streams. Owned and freed
+     * together with this h3 stream object.
+     */
+    struct xqc_wt_stream_s         *wt_stream;
     
 
     /* stream type */

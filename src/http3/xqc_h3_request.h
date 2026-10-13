@@ -10,6 +10,24 @@
 
 #define XQC_H3_REQUEST_INITIAL_HEADERS_CAPACITY 32
 
+/*
+ * Extended CONNECT (:protocol) admission flags of a request stream.
+ * Admission rules follow RFC 8441 Section 4 and RFC 9220 Section 3; the
+ * "webtransport" upgrade token is defined by draft-ietf-webtrans-http3-07
+ * Section 3.3.
+ */
+typedef enum {
+    /* leading header section admitted as an extended CONNECT */
+    XQC_H3_WT_REQ_FLAG_EXT_CONNECT      = 1 << 0,
+    /* :protocol value is "webtransport" */
+    XQC_H3_WT_REQ_FLAG_WEBTRANSPORT     = 1 << 1,
+    /* :protocol is a valid but unsupported upgrade token (RFC 9220: 501) */
+    XQC_H3_WT_REQ_FLAG_PROTOCOL_UNKNOWN = 1 << 2,
+    /* the WT layer reset this stream (session limit / internal error);
+       the request MUST NOT be exposed to the application */
+    XQC_H3_WT_REQ_FLAG_INTERNAL_RESET   = 1 << 3,
+} xqc_h3_wt_req_flag_t;
+
 typedef struct xqc_h3_request_s {
     /* h3 stream handler */
     xqc_h3_stream_t                *h3_stream;
@@ -33,6 +51,12 @@ typedef struct xqc_h3_request_s {
     xqc_http_headers_t              h3_header[XQC_H3_REQUEST_MAX_HEADERS_CNT];
     /* number of fully processed HEADERS frames */
     uint8_t                         completed_header_count;
+
+    /* extended CONNECT admission state, see xqc_h3_wt_req_flag_t */
+    uint8_t                         wt_flags;
+
+    /* WebTransport session bound to this request, NULL when not a session */
+    struct xqc_wt_session_s         *wt_session;
 
     /* received body buf list and statistic information */
     xqc_list_head_t                 body_buf;

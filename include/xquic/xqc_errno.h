@@ -99,6 +99,9 @@ typedef enum {
     H3_MESSAGE_ERROR                = 0x10E,
     H3_CONNECT_ERROR                = 0x10F,
     H3_VERSION_FALLBACK             = 0x110,
+    /* RFC 9297 §2: HTTP Datagram received for a request with no known
+       datagram semantics; deliberately outside the 0x1xx range */
+    H3_DATAGRAM_ERROR               = 0x33,
 } xqc_h3_err_code_t;
 
 /**
@@ -301,6 +304,8 @@ typedef enum {
     XQC_H3_INVALID_CANCEL_PUSH_ID       = 838,  /**< RFC 9114 §7.2.3 */
     XQC_H3_RESERVED_FRAME_UNEXPECTED    = 839,  /**< HTTP/2 reserved frame received, RFC 9114 §7.2.8 */
     XQC_H3_INVALID_GOAWAY_ID            = 840,  /**< RFC 9114 §5.2 */
+    XQC_H3_WT_SESSION_ID_ERROR          = 841,  /**< WebTransport session ID is not a valid client-initiated bidi stream ID (draft-ietf-webtrans-http3-07 Section 4) */
+    XQC_H3_WT_DATAGRAM_ERROR            = 842,  /**< malformed HTTP datagram on a WebTransport session (RFC 9297 §2.1) */
 
     XQC_H3_ERR_MAX,
 } xqc_h3_error_t;

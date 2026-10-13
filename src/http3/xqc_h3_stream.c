@@ -9,6 +9,7 @@
 #include "src/transport/xqc_engine.h"
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ext_bytestream.h"
+#include "src/http3/xqc_webtransport.h"
 
 xqc_h3_stream_t *
 xqc_h3_stream_create(xqc_h3_conn_t *h3c, xqc_stream_t *stream, xqc_h3_stream_type_t type,
@@ -94,6 +95,13 @@ xqc_h3_stream_destroy(xqc_h3_stream_t *h3s)
     //TODO: destroy bytestream
     if (h3s->h3_ext_bs && h3s->type == XQC_H3_STREAM_TYPE_BYTESTEAM) {
         xqc_h3_ext_bytestream_destroy(h3s->h3_ext_bs);
+    }
+
+    /* unlink the WebTransport stream handle (frees it when the session is
+     * already gone), draft-07 Sections 4.1/4.2 */
+    if (h3s->wt_stream) {
+        xqc_wt_stream_on_h3_stream_destroy(h3s->wt_stream);
+        h3s->wt_stream = NULL;
     }
 
     xqc_h3_frm_reset_pctx(&h3s->pctx.frame_pctx);
@@ -679,6 +687,30 @@ xqc_h3_stream_write_notify(xqc_stream_t *stream, void *user_data)
 
     xqc_log(h3s->log, XQC_LOG_DEBUG, "|xqc_h3_stream_send_buffer|success|");
 
+    /* flush WebTransport frames that hit EAGAIN earlier */
+    if (h3s->type == XQC_H3_STREAM_TYPE_REQUEST && h3s->h3r
+        && h3s->h3r->wt_session)
+    {
+        ret = xqc_wt_conn_on_request_writable(h3s->h3c, h3s->h3r);
+        if (ret < 0) {
+            xqc_log(h3s->log, XQC_LOG_ERROR,
+                    "|xqc_wt_conn_on_request_writable error|%d|stream_id:%ui|",
+                    ret, h3s->stream_id);
+            return ret;
+        }
+    }
+
+    /* flush WebTransport data stream bytes that hit EAGAIN earlier */
+    if (h3s->wt_stream) {
+        ret = xqc_wt_stream_flush(h3s->wt_stream);
+        if (ret < 0) {
+            xqc_log(h3s->log, XQC_LOG_ERROR,
+                    "|xqc_wt_stream_flush error|%d|stream_id:%ui|",
+                    ret, h3s->stream_id);
+            return ret;
+        }
+    }
+
     /* request write  */
     if (h3s->type == XQC_H3_STREAM_TYPE_REQUEST
         && (h3s->flags & XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY))
@@ -813,6 +845,10 @@ xqc_h3_stream_process_control(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                     xqc_h3_frm_reset_pctx(pctx);
                     return -H3_SETTINGS_ERROR;
                 }
+
+                /* complete WebTransport accepts deferred until the client
+                   SETTINGS (draft-ietf-webtrans-http3-07 Section 3.1) */
+                xqc_wt_conn_on_peer_settings(h3c);
                 break;
 
             case XQC_H3_FRM_GOAWAY:
@@ -968,6 +1004,21 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
 
     if (data_len == 0) {
         if (fin_flag) {
+            /*
+             * RFC 9297 Section 3.3: a clean FIN carrying a truncated trailing
+             * capsule is malformed; verify the capsule state before the
+             * stream end is accepted
+             */
+            if (h3s->h3r->wt_session != NULL
+                && xqc_wt_session_process_capsules(h3s->h3r->wt_session, data, 0,
+                                                   XQC_TRUE) < 0)
+            {
+                xqc_log(h3s->log, XQC_LOG_ERROR,
+                        "|webtransport capsule truncated at stream end|"
+                        "stream_id:%ui|", h3s->stream_id);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
             /* process fin only */
             ret = xqc_h3_request_on_recv_empty_fin(h3s->h3r);
             if (ret < 0) {
@@ -996,6 +1047,25 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
         processed += read;
 
         xqc_bool_t fin = pctx->state == XQC_H3_FRM_STATE_END ? XQC_TRUE : XQC_FALSE;
+
+        /*
+         * draft-07 Section 4.2: WEBTRANSPORT_STREAM (0x41) is only legal as
+         * the very first bytes of a request stream, where it is intercepted
+         * before frame parsing (xqc_h3_stream_process_bidi). As a regular
+         * frame type on a request stream it is a connection error of type
+         * H3_FRAME_ERROR.
+         */
+        if (h3s->h3c->wt != NULL
+            && pctx->state >= XQC_H3_FRM_STATE_LEN
+            && pctx->frame.type == XQC_WT_BIDI_SIGNAL_VALUE)
+        {
+            xqc_log(h3s->log, XQC_LOG_ERROR,
+                    "|WEBTRANSPORT_STREAM frame on established request stream|"
+                    "conn:%p|stream_id:%ui|", h3s->h3c->conn, h3s->stream_id);
+            xqc_h3_frm_reset_pctx(pctx);
+            XQC_H3_CONN_ERR(h3s->h3c, H3_FRAME_ERROR, -XQC_H3_INVALID_FRAME_TYPE);
+            return -XQC_H3_INVALID_FRAME_TYPE;
+        }
 
         /* begin to parse the payload of a frame */
         if (pctx->state >= XQC_H3_FRM_STATE_PAYLOAD) {
@@ -1105,6 +1175,37 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                     return -XQC_H3_REQUEST_FRAME_UNEXPECTED;
                 }
 
+                /*
+                 * RFC 9297 Section 3.2: on a WebTransport CONNECT stream the
+                 * DATA frame payloads carry the capsule protocol instead of
+                 * HTTP content; the session layer parses the capsules.
+                 */
+                if (h3s->h3r->wt_session != NULL) {
+                    len = xqc_min(pctx->frame.len - pctx->frame.consumed_len,
+                                  data_len - processed);
+                    ret = xqc_wt_session_process_capsules(h3s->h3r->wt_session,
+                                                          data + processed, len,
+                                                          XQC_FALSE);
+                    if (ret < 0) {
+                        xqc_log(h3s->log, XQC_LOG_ERROR,
+                                "|webtransport capsule error|stream_id:%ui|",
+                                h3s->stream_id);
+                        xqc_h3_frm_reset_pctx(pctx);
+                        return -XQC_H3_EMALFORMED_HEADER;
+                    }
+
+                    processed += len;
+                    pctx->frame.consumed_len += len;
+
+                    if (pctx->frame.len == pctx->frame.consumed_len) {
+                        fin = 1;
+                        if (fin_flag && processed == data_len) {
+                            h3s->h3r->fin_flag = fin_flag;
+                        }
+                    }
+                    break;
+                }
+
                 len = xqc_min(pctx->frame.len - pctx->frame.consumed_len, data_len - processed);
                 buf = xqc_var_buf_create(len);
                 if (buf == NULL) {
@@ -1177,6 +1278,21 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                 xqc_log_event(h3s->log, HTTP_FRAME_PARSED, h3s);
                 xqc_h3_frm_reset_pctx(pctx);
             }
+        }
+    }
+
+    /*
+     * RFC 9297 Section 3.3: a clean stream end carrying a truncated trailing
+     * capsule is treated as a malformed message
+     */
+    if (fin_flag && h3s->h3r->wt_session != NULL) {
+        ret = xqc_wt_session_process_capsules(h3s->h3r->wt_session, data, 0,
+                                              XQC_TRUE);
+        if (ret < 0) {
+            xqc_log(h3s->log, XQC_LOG_ERROR,
+                    "|webtransport capsule truncated at stream end|stream_id:%ui|",
+                    h3s->stream_id);
+            return -XQC_H3_EMALFORMED_HEADER;
         }
     }
 
@@ -1290,7 +1406,8 @@ xqc_h3_stream_process_uni_stream_type(const uint8_t *data, size_t data_len,
 
 /* process uni stream payload */
 ssize_t
-xqc_h3_stream_process_uni_payload(xqc_h3_stream_t *h3s, unsigned char *data, size_t data_len)
+xqc_h3_stream_process_uni_payload(xqc_h3_stream_t *h3s, unsigned char *data, size_t data_len,
+    xqc_bool_t fin)
 {
     ssize_t processed = 0;
     xqc_log(h3s->log, XQC_LOG_DEBUG, "|xqc_h3_stream_process_uni_payload|type:%d|sz:%uz|",
@@ -1313,6 +1430,19 @@ xqc_h3_stream_process_uni_payload(xqc_h3_stream_t *h3s, unsigned char *data, siz
         processed = xqc_qpack_process_decoder(h3s->qpack, data, data_len);
         break;
 
+    case XQC_H3_STREAM_TYPE_WT:
+        /* WebTransport uni stream: session ID prefix + payload */
+        if (h3s->h3c->wt != NULL) {
+            processed = xqc_wt_stream_process_in(h3s, data, data_len, fin);
+
+        } else {
+            /* WebTransport not enabled: the stream type is unknown here,
+               its bytes are ignored (draft-07 Section 4.1 has no
+               reserving effect beyond WebTransport-aware endpoints) */
+            processed = data_len;
+        }
+        break;
+
     /* bytes from reserved stream type will be ignored */
     default:
         processed = data_len;
@@ -1324,7 +1454,8 @@ xqc_h3_stream_process_uni_payload(xqc_h3_stream_t *h3s, unsigned char *data, siz
 
 
 ssize_t
-xqc_h3_stream_process_uni(xqc_h3_stream_t *h3s, unsigned char *data, size_t data_len)
+xqc_h3_stream_process_uni(xqc_h3_stream_t *h3s, unsigned char *data, size_t data_len,
+    xqc_bool_t fin_flag)
 {
     ssize_t processed = 0;
 
@@ -1360,10 +1491,19 @@ xqc_h3_stream_process_uni(xqc_h3_stream_t *h3s, unsigned char *data, size_t data
         }
     }
 
-    if (data_len != processed) {
+    /*
+     * WebTransport uni streams carry a FIN without payload (draft-ietf-webtrans-http3-07
+     * Section 4.1), so a signal-only FIN must still reach the WT module. Other
+     * stream types keep the "no bytes, no delivery" behavior.
+     */
+    if (data_len != processed
+        || (fin_flag
+            && (h3s->flags & XQC_HTTP3_STREAM_FLAG_TYPE_IDENTIFIED)
+            && h3s->type == XQC_H3_STREAM_TYPE_WT))
+    {
         /* deliver data to modules which is concerned */
         ssize_t read = xqc_h3_stream_process_uni_payload(h3s, data + processed,
-                                                         data_len - processed);
+                                                         data_len - processed, fin_flag);
         if (read < 0 || read + processed != data_len) {
             xqc_log(h3s->log, XQC_LOG_ERROR, "|error processing uni-stream payload|type:%d|"
                     "sz:%uz|processed:%z|", h3s->type, data_len, read);
@@ -1391,6 +1531,11 @@ xqc_h3_stream_process_bidi_payload(xqc_h3_stream_t *h3s, unsigned char *data, si
         //TODO: process bytestream 
         processed = xqc_h3_stream_process_bytestream(h3s, data, data_len, fin_flag);
         break; 
+
+    case XQC_H3_STREAM_TYPE_WT:
+        /* WebTransport bidi stream: session ID prefix + payload */
+        processed = xqc_wt_stream_process_in(h3s, data, data_len, fin_flag);
+        break;
 
     /* bytes from reserved stream type will be ignored */
     default:
@@ -1594,7 +1739,91 @@ xqc_h3_stream_process_bidi(xqc_h3_stream_t *h3s, unsigned char *data, size_t dat
      */
 
     if (XQC_H3_STREAM_TYPE_UNKNOWN == h3s->type) {
-        if (h3s->h3c->flags & XQC_H3_CONN_FLAG_EXT_ENABLED) {
+        if (h3s->h3c->wt != NULL && data_len > 0) {
+            /*
+             * draft-07 Section 4.2: WEBTRANSPORT_STREAM, the varint value
+             * 0x41, as the very first bytes of a bidirectional stream. It is
+             * not a proper HTTP/3 frame (it lacks a length field), so it
+             * must be intercepted before the frame parser reads a length
+             * behind it. The varint length is determined by the first byte
+             * (RFC 9000 Section 16), so parse exactly the type varint and
+             * decide on the decoded value; a partial varint simply waits
+             * for more bytes.
+             */
+            xqc_h3_frame_pctx_t *fpctx = &h3s->pctx.frame_pctx;
+            size_t needed;
+            ssize_t read;
+            xqc_int_t ret;
+
+            if (fpctx->state == XQC_H3_FRM_STATE_TYPE && fpctx->pctx.left > 0) {
+                /* continuation of a partial type varint */
+                needed = fpctx->pctx.left;
+
+            } else {
+                needed = (size_t)1 << ((data[0] & 0xc0) >> 6);
+            }
+
+            read = xqc_h3_frm_parse(data, xqc_min(data_len, needed), fpctx);
+            if (read < 0) {
+                xqc_log(h3s->log, XQC_LOG_ERROR,
+                        "|parse webtransport signal error|ret:%z|stream_id:%ui|",
+                        read, h3s->stream_id);
+                return xqc_h3_stream_process_frame_parse_error(h3s, fpctx, read);
+            }
+            processed = read;
+
+            if (fpctx->state < XQC_H3_FRM_STATE_LEN) {
+                /*
+                 * the signal varint is incomplete, all bytes are consumed.
+                 * A FIN before the varint is complete cannot be a valid
+                 * WebTransport stream (the session ID is missing); treat
+                 * the stream as a request stream, as the unknown-type
+                 * dispatcher does for a zero-length FIN.
+                 */
+                if (fin_flag && processed == (ssize_t)data_len) {
+                    ret = xqc_h3_stream_create_inner_request_stream(h3s);
+                    if (ret != XQC_OK) {
+                        xqc_log(h3s->log, XQC_LOG_ERROR,
+                                "|create request stream error|ret:%d|stream_id:%ui|",
+                                ret, h3s->stream_id);
+                        return ret;
+                    }
+                }
+
+            } else if (fpctx->frame.type == XQC_WT_BIDI_SIGNAL_VALUE) {
+                xqc_h3_frm_reset_pctx(fpctx);
+                xqc_wt_stream_on_bidi_signal(h3s);
+
+            } else if (h3s->h3c->flags & XQC_H3_CONN_FLAG_EXT_ENABLED) {
+                /*
+                 * not the WebTransport signal: hand the rest of the buffer to
+                 * the extension dispatcher, which continues from the first
+                 * frame's type already decoded in this parsing context.
+                 */
+                read = xqc_h3_stream_process_bidi_type_unknown(h3s, data + processed,
+                                                               data_len - processed, fin_flag);
+                if (read < 0) {
+                    return read;
+                }
+                processed += read;
+
+            } else {
+                /*
+                 * not the WebTransport signal: a regular request stream. The
+                 * frame parsing context keeps the first frame's decoded type,
+                 * the request path continues from it (the same way the
+                 * bytestream dispatcher hands over).
+                 */
+                ret = xqc_h3_stream_create_inner_request_stream(h3s);
+                if (ret != XQC_OK) {
+                    xqc_log(h3s->log, XQC_LOG_ERROR,
+                            "|create request stream error|ret:%d|stream_id:%ui|",
+                            ret, h3s->stream_id);
+                    return ret;
+                }
+            }
+
+        } else if (h3s->h3c->flags & XQC_H3_CONN_FLAG_EXT_ENABLED) {
             processed = xqc_h3_stream_process_bidi_type_unknown(h3s, data, data_len, fin_flag);
 
         } else {
@@ -1641,7 +1870,7 @@ xqc_h3_stream_process_in(xqc_h3_stream_t *h3s, unsigned char *data, size_t data_
 
     if (xqc_stream_is_uni(h3s->stream_id)) {
         /* process uni stream bytes */
-        processed = xqc_h3_stream_process_uni(h3s, data, data_len);
+        processed = xqc_h3_stream_process_uni(h3s, data, data_len, fin_flag);
         if (processed < 0 || processed != data_len) {
             xqc_log(h3c->log, XQC_LOG_ERROR, "|xqc_h3_stream_process_uni error|processed:%z"
                     "|size:%uz|stream_id:%ui|", processed, data_len, h3s->stream_id);
@@ -2122,6 +2351,16 @@ xqc_h3_stream_read_notify(xqc_stream_t *stream, void *user_data)
             ret = xqc_h3_ext_bytestream_notify_read(h3s->h3_ext_bs);
             if (ret < 0) {
                 xqc_log(h3s->log, XQC_LOG_ERROR, "|recv bytestream error|%d|", ret);
+                return ret;
+            }
+        }
+
+        /* WebTransport stream: notify buffered data / FIN (draft-07 4.1/4.2) */
+        if (h3s->wt_stream && xqc_wt_stream_should_notify_read(h3s->wt_stream)) {
+            ret = xqc_wt_stream_notify_read(h3s->wt_stream);
+            if (ret != XQC_OK) {
+                xqc_log(h3s->log, XQC_LOG_ERROR,
+                        "|recv webtransport stream error|%d|", ret);
                 return ret;
             }
         }

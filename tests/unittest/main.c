@@ -24,6 +24,7 @@
 #include "xqc_tls_test.h"
 #include "xqc_crypto_test.h"
 #include "xqc_h3_test.h"
+#include "xqc_webtransport_test.h"
 #include "xqc_hq_test.h"
 #include "xqc_stable_test.h"
 #include "xqc_dtable_test.h"
@@ -368,6 +369,39 @@ main(int argc, char *argv[])
                         xqc_test_h3_goaway_id_increase_rejected)
         || !CU_add_test(pSuite, "xqc_test_h3_settings_accepted",
                         xqc_test_h3_settings_accepted)
+        /* draft-ietf-webtrans-http3-07: WebTransport over HTTP/3 */
+        || !CU_add_test(pSuite, "xqc_test_wt_settings",
+                        xqc_test_wt_settings)
+        || !CU_add_test(pSuite, "xqc_test_wt_connect_validation",
+                        xqc_test_wt_connect_validation)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_accept",
+                        xqc_test_wt_session_accept)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_reject",
+                        xqc_test_wt_session_reject)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_no_callbacks",
+                        xqc_test_wt_session_no_callbacks)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_limit",
+                        xqc_test_wt_session_limit)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_deferred_accept",
+                        xqc_test_wt_session_deferred_accept)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_close",
+                        xqc_test_wt_session_close)
+        || !CU_add_test(pSuite, "xqc_test_wt_stream_uni_recv",
+                        xqc_test_wt_stream_uni_recv)
+        || !CU_add_test(pSuite, "xqc_test_wt_stream_bidi",
+                        xqc_test_wt_stream_bidi)
+        || !CU_add_test(pSuite, "xqc_test_wt_stream_bidi_signal_frame_error",
+                        xqc_test_wt_stream_bidi_signal_frame_error)
+        || !CU_add_test(pSuite, "xqc_test_wt_stream_local_send",
+                        xqc_test_wt_stream_local_send)
+        || !CU_add_test(pSuite, "xqc_test_wt_datagram",
+                        xqc_test_wt_datagram)
+        || !CU_add_test(pSuite, "xqc_test_wt_capsule",
+                        xqc_test_wt_capsule)
+        || !CU_add_test(pSuite, "xqc_test_wt_buffered_limit",
+                        xqc_test_wt_buffered_limit)
+        || !CU_add_test(pSuite, "xqc_test_wt_session_teardown",
+                        xqc_test_wt_session_teardown)
         || !CU_add_test(pSuite,
                         "xqc_test_h3_reserved_h2_settings_rejected",
                         xqc_test_h3_reserved_h2_settings_rejected)
@@ -584,6 +618,8 @@ main(int argc, char *argv[])
                         xqc_test_moq_gateway_fanout)
         || !CU_add_test(pSuite, "xqc_test_moq_gateway_ipc_client",
                         xqc_test_moq_gateway_ipc_client)
+        || !CU_add_test(pSuite, "xqc_test_moq_wt_ops",
+                        xqc_test_moq_wt_ops)
 #endif
         /* ADD TESTS HERE */)
     {

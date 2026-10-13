@@ -50,6 +50,8 @@ xqc_config_t default_client_config = {
     .reset_token_keylen        = 0,
     .sendmmsg_on               = 0,
     .enable_h3_ext             = 0,
+    .enable_webtransport       = 0,
+    .webtransport_max_sessions = 0,
     .manually_triggered_send   = 0,
 };
 
@@ -74,6 +76,8 @@ xqc_config_t default_server_config = {
     .reset_token_keylen        = 0,
     .sendmmsg_on               = 0,
     .enable_h3_ext             = 0,
+    .enable_webtransport       = 0,
+    .webtransport_max_sessions = 0,
     .manually_triggered_send   = 0,
 };
 
@@ -157,6 +161,10 @@ xqc_set_config(xqc_config_t *dst, const xqc_config_t *src)
     dst->cfg_log_level_name = src->cfg_log_level_name;
     dst->sendmmsg_on = src->sendmmsg_on;
     dst->enable_h3_ext = src->enable_h3_ext;
+    dst->enable_webtransport = src->enable_webtransport;
+    if (src->webtransport_max_sessions > 0) {
+        dst->webtransport_max_sessions = src->webtransport_max_sessions;
+    }
 
     return XQC_OK;
 }

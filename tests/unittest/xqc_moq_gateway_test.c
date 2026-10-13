@@ -20,6 +20,26 @@
 #include "moq/demo/xqc_moq_gateway_feed.h"
 #include "moq/demo/xqc_moq_gateway_ipc.h"
 
+#include "xquic/xquic.h"
+#include "xquic/xqc_errno.h"
+#include "xquic/xqc_http3.h"
+#include "xquic/xqc_webtransport.h"
+#include "src/http3/xqc_h3_defs.h"
+#include "src/http3/xqc_h3_conn.h"
+#include "src/http3/xqc_h3_stream.h"
+#include "src/http3/xqc_h3_request.h"
+#include "src/http3/xqc_webtransport.h"
+#include "src/http3/frame/xqc_h3_frame.h"
+#include "src/transport/xqc_engine.h"
+#include "src/transport/xqc_stream.h"
+#include "src/common/utils/vint/xqc_variable_len_int.h"
+#include "moq/xqc_moq.h"
+#include "moq/moq_transport/xqc_moq_message.h"
+#include "moq/moq_transport/xqc_moq_session.h"
+#include "moq/moq_transport/xqc_moq_stream.h"
+#include "moq/moq_transport/xqc_moq_stream_webtransport.h"
+#include "xqc_common_test.h"
+
 /* ── mock writer for the fan-out tests ───────────────────────────────────── */
 
 typedef struct xqc_gw_test_writer_s {
@@ -845,4 +865,692 @@ xqc_test_moq_gateway_ipc_client(void)
     close(lfd);
     unlink(path);
     event_base_free(eb);
+}
+
+/* ------------------------------------------------------------------------
+ * E9.2: MoQ over WebTransport — transport ops + glue callbacks end to end
+ *
+ * Drives the whole seam the gateway will use (E8): a WebTransport CONNECT
+ * offer is accepted with the MoQ user session as session user data, a MoQ
+ * session is created on the accepted WT session (server engine), and the
+ * E7 glue callbacks are registered as the WT stream callbacks. The test
+ * exercises the WT transport ops (create/write/close/quic_stream) on a
+ * local stream and the driver path (client SETUP over a peer-initiated
+ * bidi control stream), including both stream teardown orders: the local
+ * one is detached by the application first, the control one is released
+ * by the glue when its transport stream dies.
+ * ------------------------------------------------------------------------ */
+
+/* not exposed in xqc_h3_stream.h, but stable file-scope entries used by tests */
+xqc_int_t xqc_h3_stream_process_in(xqc_h3_stream_t *h3s, unsigned char *data,
+    size_t data_len, xqc_bool_t fin_flag);
+int xqc_h3_stream_read_notify(xqc_stream_t *stream, void *user_data);
+
+typedef struct {
+    /* embedded: xqc_moq_session_create() stores this address in the session */
+    xqc_moq_user_session_t  us;
+
+    /* WebTransport callbacks */
+    xqc_wt_session_t       *offer_session;
+    void                   *offer_conn_user_data;
+    int                     offer_count;
+    int                     accepted_count;
+    void                   *accepted_user_data;
+    xqc_wt_session_t       *session_closed;
+    void                   *session_closed_user_data;
+    int                     session_closed_count;
+    xqc_wt_session_t       *opened_session;
+    xqc_wt_stream_t        *opened_stream[4];
+    int                     opened_count;
+    xqc_wt_stream_t        *read_stream;
+    void                   *read_stream_user_data;
+    int                     read_count;
+    xqc_wt_stream_t        *closed_stream;
+    void                   *closed_stream_user_data;
+    int                     closed_stream_count;
+
+    /* MoQ session callbacks */
+    xqc_moq_user_session_t *moq_setup_user_session;
+    char                   *moq_setup_extdata;
+    int                     moq_setup_count;
+} moq_wt_cap_t;
+
+static moq_wt_cap_t g_moq_wt;
+
+static void
+moq_wt_cap_reset(void)
+{
+    memset(&g_moq_wt, 0, sizeof(g_moq_wt));
+}
+
+static xqc_int_t
+moq_wt_cb_on_request(xqc_wt_session_t *session, void *conn_user_data)
+{
+    g_moq_wt.offer_session = session;
+    g_moq_wt.offer_conn_user_data = conn_user_data;
+    g_moq_wt.offer_count++;
+    return XQC_OK;
+}
+
+static xqc_int_t
+moq_wt_cb_on_accepted(xqc_wt_session_t *session, void *session_user_data)
+{
+    (void)session;
+    g_moq_wt.accepted_count++;
+    g_moq_wt.accepted_user_data = session_user_data;
+    return XQC_OK;
+}
+
+static xqc_int_t
+moq_wt_cb_on_session_closed(xqc_wt_session_t *session, void *session_user_data)
+{
+    g_moq_wt.session_closed = session;
+    g_moq_wt.session_closed_user_data = session_user_data;
+    g_moq_wt.session_closed_count++;
+    return XQC_OK;
+}
+
+/* stream events are recorded here and then routed to the E7 MoQ glue, the
+ * exact wiring an application does with its xqc_wt_callbacks_t */
+static xqc_int_t
+moq_wt_cb_on_stream_opened(xqc_wt_session_t *session, xqc_wt_stream_t *stream,
+    void *session_user_data)
+{
+    if (g_moq_wt.opened_count < 4) {
+        g_moq_wt.opened_stream[g_moq_wt.opened_count] = stream;
+    }
+    g_moq_wt.opened_session = session;
+    g_moq_wt.opened_count++;
+    return xqc_moq_wt_on_stream_opened(session, stream, session_user_data);
+}
+
+static xqc_int_t
+moq_wt_cb_on_stream_read(xqc_wt_stream_t *stream, void *stream_user_data)
+{
+    g_moq_wt.read_stream = stream;
+    g_moq_wt.read_stream_user_data = stream_user_data;
+    g_moq_wt.read_count++;
+    return xqc_moq_wt_on_stream_read(stream, stream_user_data);
+}
+
+static xqc_int_t
+moq_wt_cb_on_stream_closed(xqc_wt_stream_t *stream, void *stream_user_data)
+{
+    g_moq_wt.closed_stream = stream;
+    g_moq_wt.closed_stream_user_data = stream_user_data;
+    g_moq_wt.closed_stream_count++;
+    return xqc_moq_wt_on_stream_closed(stream, stream_user_data);
+}
+
+static xqc_int_t
+moq_wt_cb_on_datagram(xqc_wt_session_t *session, void *session_user_data)
+{
+    (void)session;
+    (void)session_user_data;
+    return XQC_OK;
+}
+
+static void
+moq_wt_register_wt_cbs(xqc_h3_conn_t *h3c)
+{
+    xqc_wt_callbacks_t cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.session_request_notify = moq_wt_cb_on_request;
+    cbs.session_accepted_notify = moq_wt_cb_on_accepted;
+    cbs.session_closed_notify = moq_wt_cb_on_session_closed;
+    cbs.stream_opened_notify = moq_wt_cb_on_stream_opened;
+    cbs.stream_read_notify = moq_wt_cb_on_stream_read;
+    cbs.stream_closed_notify = moq_wt_cb_on_stream_closed;
+    cbs.datagram_read_notify = moq_wt_cb_on_datagram;
+
+    CU_ASSERT(xqc_h3_conn_set_webtransport_callbacks(h3c, &cbs) == XQC_OK);
+}
+
+/* MoQ session callbacks: only on_session_setup is exercised by this test */
+static void
+moq_wt_moq_session_setup(xqc_moq_user_session_t *user_session, char *extdata)
+{
+    g_moq_wt.moq_setup_user_session = user_session;
+    g_moq_wt.moq_setup_extdata = extdata;
+    g_moq_wt.moq_setup_count++;
+}
+
+static void
+moq_wt_moq_stub_datachannel(xqc_moq_user_session_t *user_session)
+{
+    (void)user_session;
+}
+
+static void
+moq_wt_moq_stub_datachannel_msg(xqc_moq_user_session_t *user_session,
+    uint8_t *msg, size_t msg_len)
+{
+    (void)user_session;
+    (void)msg;
+    (void)msg_len;
+}
+
+static void
+moq_wt_moq_stub_subscribe(xqc_moq_user_session_t *user_session,
+    uint64_t subscribe_id, xqc_moq_track_t *track, xqc_moq_subscribe_msg_t *msg)
+{
+    (void)user_session;
+    (void)subscribe_id;
+    (void)track;
+    (void)msg;
+}
+
+static void
+moq_wt_moq_stub_request_keyframe(xqc_moq_user_session_t *user_session,
+    uint64_t subscribe_id, xqc_moq_track_t *track)
+{
+    (void)user_session;
+    (void)subscribe_id;
+    (void)track;
+}
+
+static void
+moq_wt_moq_stub_bitrate_change(xqc_moq_user_session_t *user_session,
+    uint64_t bitrate)
+{
+    (void)user_session;
+    (void)bitrate;
+}
+
+static void
+moq_wt_moq_stub_subscribe_ok(xqc_moq_user_session_t *user_session,
+    xqc_moq_subscribe_ok_msg_t *subscribe_ok)
+{
+    (void)user_session;
+    (void)subscribe_ok;
+}
+
+static void
+moq_wt_moq_stub_subscribe_error(xqc_moq_user_session_t *user_session,
+    xqc_moq_subscribe_error_msg_t *subscribe_error)
+{
+    (void)user_session;
+    (void)subscribe_error;
+}
+
+static void
+moq_wt_moq_stub_catalog(xqc_moq_user_session_t *user_session,
+    xqc_moq_track_info_t **track_info_array, xqc_int_t array_size)
+{
+    (void)user_session;
+    (void)track_info_array;
+    (void)array_size;
+}
+
+static void
+moq_wt_moq_stub_video(xqc_moq_user_session_t *user_session,
+    uint64_t subscribe_id, xqc_moq_video_frame_t *video_frame)
+{
+    (void)user_session;
+    (void)subscribe_id;
+    (void)video_frame;
+}
+
+static void
+moq_wt_moq_stub_audio(xqc_moq_user_session_t *user_session,
+    uint64_t subscribe_id, xqc_moq_audio_frame_t *audio_frame)
+{
+    (void)user_session;
+    (void)subscribe_id;
+    (void)audio_frame;
+}
+
+static xqc_moq_session_callbacks_t
+moq_wt_session_callbacks(void)
+{
+    xqc_moq_session_callbacks_t cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.on_session_setup = moq_wt_moq_session_setup;
+    cbs.on_datachannel = moq_wt_moq_stub_datachannel;
+    cbs.on_datachannel_msg = moq_wt_moq_stub_datachannel_msg;
+    cbs.on_subscribe = moq_wt_moq_stub_subscribe;
+    cbs.on_request_keyframe = moq_wt_moq_stub_request_keyframe;
+    cbs.on_bitrate_change = moq_wt_moq_stub_bitrate_change;
+    cbs.on_subscribe_ok = moq_wt_moq_stub_subscribe_ok;
+    cbs.on_subscribe_error = moq_wt_moq_stub_subscribe_error;
+    cbs.on_catalog = moq_wt_moq_stub_catalog;
+    cbs.on_video = moq_wt_moq_stub_video;
+    cbs.on_audio = moq_wt_moq_stub_audio;
+    return cbs;
+}
+
+/* QPACK field section builder, no Huffman, RIC/Base handled by the frame
+ * wrapper below. Static table indexes follow RFC 9204 Appendix A. */
+typedef struct {
+    uint8_t     buf[256];
+    size_t      len;
+} moq_wt_hb_t;
+
+static void
+moq_wt_hb_indexed(moq_wt_hb_t *hb, uint8_t static_idx)
+{
+    CU_ASSERT_FATAL(static_idx < 63);
+    hb->buf[hb->len++] = (uint8_t)(0xC0 | static_idx);
+}
+
+static void
+moq_wt_hb_literal(moq_wt_hb_t *hb, const char *name, const char *value)
+{
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value);
+
+    CU_ASSERT_FATAL(hb->len + name_len + value_len + 4 < sizeof(hb->buf));
+    CU_ASSERT_FATAL(name_len < 128 && value_len < 127);
+
+    /* Literal Field Line With Literal Name: 001 N H NameLen(3+),
+     * RFC 9204 Section 4.5.6, no huffman, never-indexed clear */
+    hb->buf[hb->len++] = (uint8_t)(0x20 | (name_len < 7 ? name_len : 7));
+    if (name_len >= 7) {
+        hb->buf[hb->len++] = (uint8_t)(name_len - 7);
+    }
+    xqc_memcpy(hb->buf + hb->len, name, name_len);
+    hb->len += name_len;
+
+    hb->buf[hb->len++] = (uint8_t)value_len;
+    xqc_memcpy(hb->buf + hb->len, value, value_len);
+    hb->len += value_len;
+}
+
+/* Wrap the section into a HEADERS frame with Required Insert Count 0 and
+ * Delta Base 0. Returns the total frame length. */
+static size_t
+moq_wt_hb_frame(const moq_wt_hb_t *hb, uint8_t *out)
+{
+    uint8_t *pos = out;
+    pos = xqc_put_varint(pos, XQC_H3_FRM_HEADERS);
+    pos = xqc_put_varint(pos, hb->len + 2);
+    *pos++ = 0x00;
+    *pos++ = 0x00;
+    xqc_memcpy(pos, hb->buf, hb->len);
+    return (size_t)(pos - out) + hb->len;
+}
+
+static xqc_int_t
+moq_wt_feed_headers(xqc_h3_stream_t *h3s, const uint8_t *frame, size_t len,
+    xqc_bool_t fin)
+{
+    unsigned char buf[512];
+    CU_ASSERT_FATAL(len <= sizeof(buf));
+    xqc_memcpy(buf, frame, len);
+    return xqc_h3_stream_process_in(h3s, buf, len, fin);
+}
+
+/* client SETTINGS that advertise WebTransport support (draft-07 3.1) */
+static void
+moq_wt_make_peer_capable(xqc_h3_conn_t *h3c)
+{
+    h3c->flags |= XQC_H3_CONN_FLAG_SETTINGS_RECVED;
+    h3c->peer_h3_conn_settings.webtransport_max_sessions = 64;
+    h3c->peer_h3_conn_settings.h3_datagram = 1;
+}
+
+/* feed a valid WebTransport CONNECT request on the request stream */
+static xqc_int_t
+moq_wt_feed_wt_connect(xqc_h3_stream_t *h3s, xqc_bool_t fin)
+{
+    uint8_t frame[512];
+    moq_wt_hb_t hb = {0};
+
+    moq_wt_hb_indexed(&hb, 15);                     /* :method CONNECT */
+    moq_wt_hb_literal(&hb, ":protocol", "webtransport");
+    moq_wt_hb_indexed(&hb, 23);                     /* :scheme https */
+    moq_wt_hb_literal(&hb, ":authority", "example.com");
+    moq_wt_hb_indexed(&hb, 1);                      /* :path / */
+    moq_wt_hb_literal(&hb, "origin", "https://example.com");
+
+    size_t len = moq_wt_hb_frame(&hb, frame);
+    return moq_wt_feed_headers(h3s, frame, len, fin);
+}
+
+/* established h3 request context on a server-like engine: the conn is built
+ * as a client by the shared helper, then its engine is retyped SERVER because
+ * the MoQ WebTransport session-create guard requires it */
+static xqc_h3_stream_t *
+moq_wt_req_setup(xqc_connection_t **out_conn, xqc_h3_conn_t **out_h3c)
+{
+    xqc_connection_t *conn = test_engine_connect();
+    if (conn == NULL) {
+        return NULL;
+    }
+
+    conn->engine->eng_type = XQC_ENGINE_SERVER;
+
+    if (conn->alpn) {
+        xqc_free(conn->alpn);
+    }
+    conn->alpn_len = strlen(XQC_ALPN_H3);
+    conn->alpn = xqc_calloc(1, conn->alpn_len + 1);
+    xqc_memcpy(conn->alpn, XQC_ALPN_H3, conn->alpn_len);
+
+    /* test_connect() creates the conn with the "transport" ALPN whose callbacks
+       are all NULL; production resolves conn->app_proto_cbs when the negotiated
+       ALPN is known. Streams capture conn->app_proto_cbs.stream_cbs at creation,
+       so refresh the callbacks to the h3 set after swapping the ALPN. */
+    if (xqc_engine_get_alpn_callbacks(conn->engine, XQC_ALPN_H3,
+            conn->alpn_len, &conn->app_proto_cbs) != XQC_OK)
+    {
+        return NULL;
+    }
+
+    conn->conn_flow_ctl.fc_max_streams_bidi_can_send = 1024;
+    conn->conn_flow_ctl.fc_max_streams_uni_can_send = 1024;
+    conn->conn_state = XQC_CONN_STATE_ESTABED;
+
+    conn->engine->config->enable_webtransport = 1;
+    conn->engine->config->webtransport_max_sessions = 16;
+
+    xqc_h3_conn_t *h3c = xqc_h3_conn_create(conn, NULL);
+    if (h3c == NULL) {
+        return NULL;
+    }
+
+    /* the QPACK encoder stream carries encoder instructions for responses */
+    h3c->qenc_stream = xqc_h3_conn_create_uni_stream(h3c,
+            XQC_H3_STREAM_TYPE_QPACK_ENCODER);
+    if (h3c->qenc_stream == NULL) {
+        return NULL;
+    }
+
+    xqc_stream_t *stream = xqc_create_stream_with_conn(conn,
+            XQC_UNDEFINE_STREAM_ID, XQC_CLI_BID, NULL, NULL);
+    if (stream == NULL) {
+        return NULL;
+    }
+
+    xqc_h3_stream_t *h3s = xqc_h3_stream_create(h3c, stream,
+            XQC_H3_STREAM_TYPE_REQUEST, NULL);
+    if (h3s == NULL) {
+        return NULL;
+    }
+
+    h3s->h3r = xqc_h3_request_create_inner(h3c, h3s, NULL);
+    if (h3s->h3r == NULL) {
+        return NULL;
+    }
+
+    *out_conn = conn;
+    *out_h3c = h3c;
+    return h3s;
+}
+
+static void
+moq_wt_req_teardown(xqc_h3_stream_t *h3s, xqc_h3_conn_t *h3c,
+    xqc_connection_t *conn)
+{
+    xqc_stream_t *stream = h3s->stream;
+    stream->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+    xqc_h3_stream_destroy(h3s);
+    xqc_destroy_stream(stream);
+
+    xqc_stream_t *qenc = h3c->qenc_stream->stream;
+    qenc->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+    xqc_h3_stream_destroy(h3c->qenc_stream);
+    xqc_destroy_stream(qenc);
+
+    xqc_h3_conn_destroy(h3c);
+    if (conn->alpn) {
+        xqc_free(conn->alpn);
+    }
+}
+
+/* a peer-initiated data stream, as the transport would present it */
+static xqc_h3_stream_t *
+moq_wt_open_peer_stream(xqc_connection_t *conn, xqc_h3_conn_t *h3c,
+    xqc_bool_t bidi)
+{
+    xqc_stream_t *stream = xqc_create_stream_with_conn(conn,
+            XQC_UNDEFINE_STREAM_ID, bidi ? XQC_CLI_BID : XQC_CLI_UNI,
+            NULL, NULL);
+    if (stream == NULL) {
+        return NULL;
+    }
+
+    xqc_h3_stream_t *h3s = xqc_h3_stream_create(h3c, stream,
+            XQC_H3_STREAM_TYPE_UNKNOWN, NULL);
+    if (h3s == NULL) {
+        xqc_destroy_stream(stream);
+    }
+
+    return h3s;
+}
+
+static xqc_int_t
+moq_wt_feed_stream_data(xqc_h3_stream_t *h3s, const unsigned char *data,
+    size_t data_len, xqc_bool_t fin)
+{
+    unsigned char buf[512];
+    CU_ASSERT_FATAL(data_len <= sizeof(buf));
+    if (data_len > 0) {
+        xqc_memcpy(buf, data, data_len);
+    }
+    return xqc_h3_stream_process_in(h3s, buf, data_len, fin);
+}
+
+static void
+moq_wt_destroy_data_stream(xqc_h3_stream_t *h3s)
+{
+    xqc_stream_t *stream = h3s->stream;
+    stream->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+    xqc_h3_stream_destroy(h3s);
+    xqc_destroy_stream(stream);
+}
+
+void
+xqc_test_moq_wt_ops(void)
+{
+    moq_wt_cap_reset();
+
+    xqc_connection_t *conn = NULL;
+    xqc_h3_conn_t *h3c = NULL;
+    xqc_h3_stream_t *h3s = moq_wt_req_setup(&conn, &h3c);
+    CU_ASSERT_FATAL(h3s != NULL);
+    CU_ASSERT_FATAL(h3c->wt != NULL);
+
+    moq_wt_register_wt_cbs(h3c);
+    moq_wt_make_peer_capable(h3c);
+
+    /* --- CONNECT offer accepted with the MoQ user session --- */
+    CU_ASSERT(moq_wt_feed_wt_connect(h3s, XQC_TRUE) == XQC_OK);
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT_EQUAL(g_moq_wt.offer_count, 1);
+    CU_ASSERT_FATAL(g_moq_wt.offer_session != NULL);
+    CU_ASSERT_PTR_NULL(g_moq_wt.offer_conn_user_data);
+    CU_ASSERT_EQUAL(g_moq_wt.accepted_count, 0);
+
+    xqc_wt_session_t *wt_session = g_moq_wt.offer_session;
+    CU_ASSERT_EQUAL(xqc_wt_session_get_stream_id(wt_session), h3s->stream_id);
+    CU_ASSERT_PTR_EQUAL(xqc_wt_session_get_quic_conn(wt_session), conn);
+    CU_ASSERT_PTR_NULL(xqc_wt_session_get_user_data(wt_session));
+
+    CU_ASSERT(xqc_wt_session_accept(wt_session, &g_moq_wt.us) == XQC_OK);
+    CU_ASSERT_EQUAL(g_moq_wt.accepted_count, 1);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.accepted_user_data, &g_moq_wt.us);
+    CU_ASSERT_PTR_EQUAL(xqc_wt_session_get_user_data(wt_session), &g_moq_wt.us);
+    CU_ASSERT(conn->conn_err == 0);
+
+    /* --- the MoQ session requires a server engine (E7 guard) --- */
+    xqc_moq_user_session_t neg_us;
+    memset(&neg_us, 0, sizeof(neg_us));
+    conn->engine->eng_type = XQC_ENGINE_CLIENT;
+    CU_ASSERT_PTR_NULL(xqc_moq_session_create(wt_session, &neg_us,
+        XQC_MOQ_TRANSPORT_WEBTRANSPORT, XQC_MOQ_PUBSUB,
+        moq_wt_session_callbacks(), NULL));
+    CU_ASSERT_PTR_NULL(neg_us.session);
+    conn->engine->eng_type = XQC_ENGINE_SERVER;
+
+    /* --- MoQ session on the accepted WT session --- */
+    xqc_moq_session_t *moq_session = xqc_moq_session_create(wt_session,
+        &g_moq_wt.us, XQC_MOQ_TRANSPORT_WEBTRANSPORT, XQC_MOQ_PUBSUB,
+        moq_wt_session_callbacks(), NULL);
+    CU_ASSERT_FATAL(moq_session != NULL);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.us.session, moq_session);
+    CU_ASSERT_EQUAL(moq_session->transport_type, XQC_MOQ_TRANSPORT_WEBTRANSPORT);
+    CU_ASSERT_EQUAL(moq_session->role, XQC_MOQ_PUBSUB);
+    CU_ASSERT_PTR_EQUAL(moq_session->trans_conn, wt_session);
+    CU_ASSERT_PTR_EQUAL(moq_session->quic_conn, conn);
+    CU_ASSERT_EQUAL(moq_session->session_setup_done, 0);
+    CU_ASSERT_PTR_NULL(moq_session->ctl_stream);
+
+    /* --- local stream through the WT transport ops --- */
+    xqc_moq_stream_t *uni = xqc_moq_stream_create_with_transport(moq_session,
+        XQC_STREAM_UNI);
+    CU_ASSERT_FATAL(uni != NULL);
+    CU_ASSERT(memcmp(&uni->trans_ops, &xqc_moq_wt_stream_ops,
+        sizeof(uni->trans_ops)) == 0);
+    CU_ASSERT_EQUAL(g_moq_wt.opened_count, 1);      /* local creates announce too */
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.opened_stream[0], uni->trans_stream);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.opened_session, wt_session);
+
+    xqc_wt_stream_t *wts_uni = (xqc_wt_stream_t *)uni->trans_stream;
+    CU_ASSERT_FATAL(wts_uni != NULL);
+    CU_ASSERT_EQUAL(wts_uni->local, 1);
+    CU_ASSERT_EQUAL(wts_uni->bidi, 0);
+    CU_ASSERT_EQUAL(wts_uni->closed, 0);
+    CU_ASSERT_PTR_EQUAL(wts_uni->session, wt_session);
+    /* the glue must leave the ops-bound user data alone on local streams */
+    CU_ASSERT_PTR_EQUAL(xqc_wt_stream_get_user_data(wts_uni), uni);
+    CU_ASSERT_PTR_EQUAL(uni->trans_ops.quic_stream(uni->trans_stream),
+        wts_uni->h3s->stream);
+
+    /* "signal + session ID" prefix, pending without 1-RTT keys */
+    uint8_t expected[16];
+    uint8_t *ep = expected;
+    ep = xqc_put_varint(ep, XQC_WT_UNI_STREAM_TYPE);
+    ep = xqc_put_varint(ep, wt_session->stream_id);
+    size_t prefix_len = (size_t)(ep - expected);
+    CU_ASSERT_FATAL(wts_uni->send_buf != NULL);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->data_len, prefix_len);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->consumed_len, 0);
+    CU_ASSERT(memcmp(wts_uni->send_buf->data, expected, prefix_len) == 0);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->data[0], 0x40);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->data[1], 0x54);
+
+    /* ops.write appends behind the prefix */
+    CU_ASSERT(uni->trans_ops.write(uni->trans_stream, (uint8_t *)"xy", 2, 0)
+        == 2);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->data_len, prefix_len + 2);
+    CU_ASSERT_EQUAL(wts_uni->send_buf->consumed_len, 0);
+    CU_ASSERT(memcmp(wts_uni->send_buf->data + prefix_len, "xy", 2) == 0);
+
+    /* ops.close resets the transport stream; further writes are refused */
+    CU_ASSERT(uni->trans_ops.close(uni->trans_stream) == XQC_OK);
+    CU_ASSERT_EQUAL(wts_uni->closed, 1);
+    CU_ASSERT(uni->trans_ops.write(uni->trans_stream, (uint8_t *)"z", 1, 0)
+        == -XQC_ESTATE);
+
+    /* --- peer bidi stream: the glue binds it as the MoQ control stream --- */
+    xqc_h3_stream_t *h3s_ctl = moq_wt_open_peer_stream(conn, h3c, XQC_TRUE);
+    CU_ASSERT_FATAL(h3s_ctl != NULL);
+
+    uint8_t ctl_wire[16];
+    ep = ctl_wire;
+    ep = xqc_put_varint(ep, XQC_WT_BIDI_SIGNAL_VALUE);
+    ep = xqc_put_varint(ep, wt_session->stream_id);
+    size_t ctl_wire_len = (size_t)(ep - ctl_wire);
+
+    /* first byte only: the signal must not create a stream yet */
+    CU_ASSERT(moq_wt_feed_stream_data(h3s_ctl, ctl_wire, 1, XQC_FALSE)
+        == XQC_OK);
+    CU_ASSERT_PTR_NULL(h3s_ctl->wt_stream);
+    /* rest: 0x41 recognized, prefix parsed, stream opened */
+    CU_ASSERT(moq_wt_feed_stream_data(h3s_ctl, ctl_wire + 1,
+        ctl_wire_len - 1, XQC_FALSE) == XQC_OK);
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT_EQUAL(g_moq_wt.opened_count, 2);
+
+    CU_ASSERT_FATAL(moq_session->ctl_stream != NULL);
+    xqc_moq_stream_t *moq_ctl = moq_session->ctl_stream;
+    xqc_wt_stream_t *wts_ctl = h3s_ctl->wt_stream;
+    CU_ASSERT_FATAL(wts_ctl != NULL);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.opened_stream[1], wts_ctl);
+    CU_ASSERT_EQUAL(wts_ctl->local, 0);
+    CU_ASSERT_EQUAL(wts_ctl->bidi, 1);
+    CU_ASSERT_PTR_EQUAL(wts_ctl->session, wt_session);
+    CU_ASSERT_PTR_EQUAL(moq_ctl->trans_stream, wts_ctl);
+    CU_ASSERT_PTR_EQUAL(xqc_wt_stream_get_user_data(wts_ctl), moq_ctl);
+    CU_ASSERT_PTR_NULL(wts_ctl->send_buf);          /* peer streams carry no prefix */
+
+    /* --- client SETUP: buffered first, processed by the read pump --- */
+    uint8_t setup[32];
+    ep = setup;
+    ep = xqc_put_varint(ep, XQC_MOQ_MSG_CLIENT_SETUP);
+    ep = xqc_put_varint(ep, 1);                     /* versions_num */
+    ep = xqc_put_varint(ep, XQC_MOQ_VERSION_5);
+    ep = xqc_put_varint(ep, 1);                     /* params_num */
+    ep = xqc_put_varint(ep, XQC_MOQ_PARAM_ROLE);
+    ep = xqc_put_varint(ep, 1);                     /* param value length */
+    *ep++ = XQC_MOQ_SUBSCRIBER;
+    size_t setup_len = (size_t)(ep - setup);
+
+    CU_ASSERT(moq_wt_feed_stream_data(h3s_ctl, setup, setup_len, XQC_TRUE)
+        == XQC_OK);
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT_EQUAL(g_moq_wt.read_count, 0);        /* buffered, not notified */
+    CU_ASSERT_EQUAL(moq_session->session_setup_done, 0);
+
+    CU_ASSERT(xqc_h3_stream_read_notify(h3s_ctl->stream, h3s_ctl) == XQC_OK);
+    CU_ASSERT(conn->conn_err == 0);
+    CU_ASSERT_EQUAL(g_moq_wt.read_count, 1);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.read_stream, wts_ctl);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.read_stream_user_data, moq_ctl);
+    CU_ASSERT_EQUAL(moq_session->session_setup_done, 1);
+    CU_ASSERT_EQUAL(moq_session->version, XQC_MOQ_VERSION_5);
+    CU_ASSERT_EQUAL(moq_session->peer_role, XQC_MOQ_SUBSCRIBER);
+    CU_ASSERT_EQUAL(g_moq_wt.moq_setup_count, 1);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.moq_setup_user_session, &g_moq_wt.us);
+    CU_ASSERT_PTR_NULL(g_moq_wt.moq_setup_extdata);
+
+    /* server SETUP and the initial SUBSCRIBEs are queued behind it */
+    uint8_t exp_setup[32];
+    ep = exp_setup;
+    ep = xqc_put_varint(ep, XQC_MOQ_MSG_SERVER_SETUP);
+    ep = xqc_put_varint(ep, XQC_MOQ_VERSION_5);
+    ep = xqc_put_varint(ep, 1);                     /* params_num */
+    ep = xqc_put_varint(ep, XQC_MOQ_PARAM_ROLE);
+    ep = xqc_put_varint(ep, 1);                     /* param value length */
+    *ep++ = XQC_MOQ_PUBSUB;
+    size_t exp_setup_len = (size_t)(ep - exp_setup);
+
+    CU_ASSERT_FATAL(wts_ctl->send_buf != NULL);
+    CU_ASSERT_EQUAL(wts_ctl->send_buf->consumed_len, 0);
+    CU_ASSERT(wts_ctl->send_buf->data_len > exp_setup_len);
+    CU_ASSERT(memcmp(wts_ctl->send_buf->data, exp_setup, exp_setup_len) == 0);
+
+    /* --- teardown: local stream detached first, then its transport dies --- */
+    xqc_moq_stream_destroy(uni);
+    CU_ASSERT_PTR_NULL(xqc_wt_stream_get_user_data(wts_uni));
+    moq_wt_destroy_data_stream(wts_uni->h3s);
+    CU_ASSERT_EQUAL(g_moq_wt.closed_stream_count, 1);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.closed_stream, wts_uni);
+    CU_ASSERT_PTR_NULL(g_moq_wt.closed_stream_user_data);
+    CU_ASSERT_PTR_NULL(wts_uni->h3s);
+    CU_ASSERT_EQUAL(wts_uni->closed, 1);
+
+    /* --- control stream death is reported to the glue, which releases the
+     * MoQ stream and clears the anchor without killing the connection --- */
+    moq_wt_destroy_data_stream(h3s_ctl);
+    CU_ASSERT_EQUAL(g_moq_wt.closed_stream_count, 2);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.closed_stream, wts_ctl);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.closed_stream_user_data, moq_ctl);
+    CU_ASSERT_PTR_NULL(moq_session->ctl_stream);
+    CU_ASSERT_PTR_NULL(xqc_wt_stream_get_user_data(wts_ctl));
+    CU_ASSERT_PTR_NULL(wts_ctl->h3s);
+    CU_ASSERT((conn->conn_flag & XQC_CONN_FLAG_ERROR) == 0);
+    CU_ASSERT(conn->conn_err == 0);
+
+    /* --- the MoQ session goes first; the WT session and its CONNECT request
+     * close last and notify exactly once --- */
+    xqc_moq_session_destroy(moq_session);
+
+    moq_wt_req_teardown(h3s, h3c, conn);
+    CU_ASSERT_EQUAL(g_moq_wt.session_closed_count, 1);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.session_closed, wt_session);
+    CU_ASSERT_PTR_EQUAL(g_moq_wt.session_closed_user_data, &g_moq_wt.us);
+    CU_ASSERT_EQUAL(g_moq_wt.closed_stream_count, 2);
+    CU_ASSERT(conn->conn_err == 0);
 }

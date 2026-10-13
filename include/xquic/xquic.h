@@ -1182,6 +1182,20 @@ typedef struct xqc_config_s {
     uint8_t         enable_h3_ext;
 
     /**
+     * @brief enable WebTransport over http3 (default: 0). When enabled,
+     * h3 connections advertise SETTINGS_ENABLE_CONNECT_PROTOCOL,
+     * SETTINGS_H3_DATAGRAM and SETTINGS_WEBTRANSPORT_MAX_SESSIONS
+     * (draft-ietf-webtrans-http3-07).
+     */
+    uint8_t         enable_webtransport;
+
+    /**
+     * @brief SETTINGS_WEBTRANSPORT_MAX_SESSIONS advertised when
+     * enable_webtransport is set; 0 falls back to the internal default
+     */
+    uint64_t        webtransport_max_sessions;
+
+    /**
      * @brief manually call mainlogic after stream/request send      
      * 
      */

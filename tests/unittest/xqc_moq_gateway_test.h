@@ -9,5 +9,6 @@ void xqc_test_moq_gateway_frame_map(void);
 void xqc_test_moq_gateway_params_merge(void);
 void xqc_test_moq_gateway_fanout(void);
 void xqc_test_moq_gateway_ipc_client(void);
+void xqc_test_moq_wt_ops(void);
 
 #endif /* _XQC_MOQ_GATEWAY_TEST_H_INCLUDED_ */

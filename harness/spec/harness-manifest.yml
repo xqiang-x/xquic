@@ -210,6 +210,33 @@ modules:
         validation:
           level: targeted
           hints: [qpack]
+    features:
+      webtransport:
+        paths:
+          - src/http3/xqc_webtransport*
+          - include/xquic/xqc_webtransport.h
+        read:
+          - harness/spec/architecture.md
+        validation:
+          level: targeted
+          unit:
+            - xqc_test_wt_settings
+            - xqc_test_wt_connect_validation
+            - xqc_test_wt_session_accept
+            - xqc_test_wt_session_reject
+            - xqc_test_wt_session_no_callbacks
+            - xqc_test_wt_session_limit
+            - xqc_test_wt_session_deferred_accept
+            - xqc_test_wt_session_close
+            - xqc_test_wt_stream_uni_recv
+            - xqc_test_wt_stream_bidi
+            - xqc_test_wt_stream_bidi_signal_frame_error
+            - xqc_test_wt_stream_local_send
+            - xqc_test_wt_datagram
+            - xqc_test_wt_capsule
+            - xqc_test_wt_buffered_limit
+            - xqc_test_wt_session_teardown
+          hints: [webtransport, h3, settings, datagram, capsule]
 
   moq:
     paths:
@@ -233,7 +260,8 @@ modules:
             - xqc_test_moq_gateway_params_merge
             - xqc_test_moq_gateway_fanout
             - xqc_test_moq_gateway_ipc_client
-          hints: [moq, subscribe, gateway]
+            - xqc_test_moq_wt_ops
+          hints: [moq, subscribe, gateway, webtransport]
     validation:
       level: targeted
 

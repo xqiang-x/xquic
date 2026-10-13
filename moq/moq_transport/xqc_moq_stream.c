@@ -1,5 +1,6 @@
 #include "src/transport/xqc_stream.h"
 #include "src/transport/xqc_conn.h"
+#include "xquic/xqc_webtransport.h"
 #include "moq/moq_transport/xqc_moq_stream.h"
 #include "moq/moq_transport/xqc_moq_session.h"
 #include "moq/moq_transport/xqc_moq_stream_quic.h"
@@ -9,16 +10,18 @@ xqc_moq_stream_t *
 xqc_moq_stream_create(xqc_moq_session_t *session)
 {
     xqc_moq_stream_t *stream = xqc_calloc(1, sizeof(*stream));
+    if (stream == NULL) {
+        return NULL;
+    }
     switch (session->transport_type) {
         case XQC_MOQ_TRANSPORT_QUIC: {
             stream->trans_ops = xqc_moq_quic_stream_ops;
             break;
         }
-        /*case XQC_MOQ_TRANSPORT_WEBTRANSPORT: {
-            //TODO: WEBTRANSPORT
+        case XQC_MOQ_TRANSPORT_WEBTRANSPORT: {
             stream->trans_ops = xqc_moq_wt_stream_ops;
             break;
-        }*/
+        }
         default: {
             xqc_log(session->log, XQC_LOG_ERROR, "|transport_type error|");
             goto error;
@@ -41,12 +44,24 @@ xqc_moq_stream_destroy(xqc_moq_stream_t *stream)
     xqc_moq_session_t *session = stream->session;
     xqc_stream_t *quic_stream = stream->trans_ops.quic_stream(stream->trans_stream);
     xqc_usec_t now = xqc_monotonic_timestamp();
-    
+
+    /*
+     * detach from the transport stream so a late transport notification
+     * cannot reach this freed object
+     */
+    if (stream->trans_stream != NULL) {
+        if (session->transport_type == XQC_MOQ_TRANSPORT_WEBTRANSPORT) {
+            xqc_wt_stream_set_user_data((xqc_wt_stream_t *)stream->trans_stream, NULL);
+        } else {
+            xqc_stream_set_user_data((xqc_stream_t *)stream->trans_stream, NULL);
+        }
+    }
+
     if (stream == stream->session->ctl_stream) {
         stream->session->ctl_stream = NULL;
         /* The control stream MUST NOT be abruptly closed at the underlying transport layer.
          * Doing so results in the session being closed as a 'Protocol Violation'. */
-        if (quic_stream->stream_conn->conn_state <= XQC_CONN_STATE_ESTABED) {
+        if (quic_stream && quic_stream->stream_conn->conn_state <= XQC_CONN_STATE_ESTABED) {
             xqc_log(session->log, XQC_LOG_ERROR, "|control stream closed|");
             xqc_moq_session_error(session, MOQ_PROTOCOL_VIOLATION, "control stream closed");
         }
@@ -54,7 +69,7 @@ xqc_moq_stream_destroy(xqc_moq_stream_t *stream)
     
     if (stream == session->datachannel.ordered_stream) {
         session->datachannel.ordered_stream = NULL;
-        if (quic_stream->stream_conn->conn_state <= XQC_CONN_STATE_ESTABED) {
+        if (quic_stream && quic_stream->stream_conn->conn_state <= XQC_CONN_STATE_ESTABED) {
             xqc_log(session->log, XQC_LOG_ERROR, "|datachannel stream closed|");
             xqc_moq_session_error(session, MOQ_INTERNAL_ERROR, "datachannel stream closed");
         }

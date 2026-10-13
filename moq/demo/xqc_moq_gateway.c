@@ -11,7 +11,10 @@
  *
  * CLI: -p port, -l log level, -c cong, -d drop, -f fec (downstream QUIC),
  *      --stream <id> (repeatable, required), --ipc <path>,
- *      --codec/--width/--height/--fps/--bitrate (catalog metadata).
+ *      --codec/--width/--height/--fps/--bitrate (catalog metadata),
+ *      --wt (also serve MoQ over WebTransport on the h3 ALPN, with
+ *      --wt-cert/--wt-key overrides and a printed certificate fingerprint
+ *      for browser serverCertificateHashes).
  */
 
 #define _GNU_SOURCE
@@ -20,14 +23,23 @@
 #include "xqc_moq_gateway_feed.h"
 #include "xqc_moq_gateway_ipc.h"
 
+#include <moq/moq_transport/xqc_moq_stream_webtransport.h>
+#include <xquic/xqc_webtransport.h>
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #include <signal.h>
 
 #define GW_DEFAULT_PORT      8443
 #define GW_DEFAULT_IPC_PATH  "/tmp/tj_rtc_sfu.sock"
+#define GW_DEFAULT_CERT_PATH "./server.crt"
+#define GW_DEFAULT_KEY_PATH  "./server.key"
 #define GW_STREAMS_MAX       32
 #define GW_FANOUT_CAP        XQC_GW_FANOUT_CAP
 #define GW_CID_LEN           12
 #define GW_PACKET_TMP_BUF    1500
+#define GW_WT_MAX_SESSIONS   16
 
 #define GW_SUB_RETRY_US      (3 * 1000000)   /* SUB re-send after SUB_ERR */
 #define GW_PLI_SUB_OK_US     (1 * 1000000)   /* PLI after SUB_OK */
@@ -46,7 +58,10 @@ static xqc_app_ctx_t ctx;
 static struct event_base *eb;
 
 static char g_ipc_path[256] = GW_DEFAULT_IPC_PATH;
+static char g_cert_path[256] = GW_DEFAULT_CERT_PATH;
+static char g_key_path[256] = GW_DEFAULT_KEY_PATH;
 static int g_fec_on = 0;
+static int g_wt_on = 0;
 static xqc_moq_role_t g_role = XQC_MOQ_PUBLISHER;
 
 struct gw_video_cfg_s {
@@ -503,38 +518,86 @@ gw_on_audio_frame(xqc_moq_user_session_t *user_session, uint64_t subscribe_id,
 
 /* ── QUIC transport callbacks ────────────────────────────────────────────── */
 
+static void
+gw_fill_session_callbacks(xqc_moq_session_callbacks_t *callbacks)
+{
+    memset(callbacks, 0, sizeof(*callbacks));
+    callbacks->on_session_setup = gw_on_session_setup;
+    callbacks->on_datachannel = gw_on_datachannel;
+    callbacks->on_datachannel_msg = gw_on_datachannel_msg;
+    callbacks->on_subscribe = gw_on_subscribe;
+    callbacks->on_request_keyframe = gw_on_request_keyframe;
+    callbacks->on_bitrate_change = gw_on_bitrate_change;
+    callbacks->on_subscribe_ok = gw_on_subscribe_ok;
+    callbacks->on_subscribe_error = gw_on_subscribe_error;
+    callbacks->on_catalog = gw_on_catalog;
+    callbacks->on_video = gw_on_video_frame;
+    callbacks->on_audio = gw_on_audio_frame;
+}
+
+static xqc_moq_session_t *
+gw_moq_session_start(void *trans_conn, xqc_moq_transport_type_t transport_type,
+    xqc_moq_user_session_t *user_session)
+{
+    xqc_moq_session_callbacks_t callbacks;
+
+    gw_fill_session_callbacks(&callbacks);
+    return xqc_moq_session_create(trans_conn, user_session, transport_type,
+        g_role, callbacks, NULL);
+}
+
+/*
+ * Per-connection arena. The embedded user_conn_t keeps the layout expected
+ * by xqc_moq_demo_comm.c (xqc_app_write_socket reads ->fd), so the shared
+ * comm helpers are reused as-is.
+ */
+static xqc_moq_user_session_t *
+gw_conn_alloc(void)
+{
+    xqc_moq_user_session_t *user_session;
+    gw_conn_t *gw;
+
+    user_session = calloc(1, sizeof(xqc_moq_user_session_t) + sizeof(gw_conn_t));
+    if (user_session == NULL) {
+        return NULL;
+    }
+    gw = (gw_conn_t *)user_session->data;
+    gw->uc.fd = ctx.listen_fd;   /* used by the shared write_socket helper */
+    return user_session;
+}
+
 static int
 gw_server_accept(xqc_engine_t *engine, xqc_connection_t *conn,
     const xqc_cid_t *cid, void *user_data)
 {
     xqc_moq_user_session_t *user_session;
     gw_conn_t *gw;
-    xqc_moq_session_callbacks_t callbacks;
-    xqc_moq_session_t *session;
 
-    user_session = calloc(1, sizeof(xqc_moq_user_session_t) + sizeof(gw_conn_t));
+    user_session = gw_conn_alloc();
     if (user_session == NULL) {
         return -1;
     }
     gw = (gw_conn_t *)user_session->data;
-    gw->uc.fd = ctx.listen_fd;   /* used by the shared write_socket helper */
 
-    memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.on_session_setup = gw_on_session_setup;
-    callbacks.on_datachannel = gw_on_datachannel;
-    callbacks.on_datachannel_msg = gw_on_datachannel_msg;
-    callbacks.on_subscribe = gw_on_subscribe;
-    callbacks.on_request_keyframe = gw_on_request_keyframe;
-    callbacks.on_bitrate_change = gw_on_bitrate_change;
-    callbacks.on_subscribe_ok = gw_on_subscribe_ok;
-    callbacks.on_subscribe_error = gw_on_subscribe_error;
-    callbacks.on_catalog = gw_on_catalog;
-    callbacks.on_video = gw_on_video_frame;
-    callbacks.on_audio = gw_on_audio_frame;
+    if (g_wt_on) {
+        /*
+         * The ALPN is not known yet on the first Initial. Attach the user
+         * data now: the shared write_socket helper dereferences it for
+         * every packet of every connection. The MoQ session starts once the
+         * ALPN resolved: gw_server_conn_create_notify for moq-quic, the WT
+         * session-accepted callback for h3.
+         */
+        xqc_conn_set_transport_user_data(conn, user_session);
+        memcpy(&gw->uc.cid, cid, sizeof(*cid));
+        printf("[gw] connection accepted (alpn pending) scid=%s\n",
+               xqc_scid_str(engine, cid));
+        (void)user_data;
+        return 0;
+    }
 
-    session = xqc_moq_session_create(conn, user_session, XQC_MOQ_TRANSPORT_QUIC,
-        g_role, callbacks, NULL);
-    if (session == NULL) {
+    if (gw_moq_session_start(conn, XQC_MOQ_TRANSPORT_QUIC,
+            user_session) == NULL)
+    {
         printf("[gw] create session error\n");
         free(user_session);
         return -1;
@@ -550,11 +613,13 @@ static void
 gw_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
     const xqc_cid_t *cid, void *user_data)
 {
-    /* log only: this path may run before accept assigned the session data */
     printf("[gw] connection refused cid=%p\n", (void *)cid);
+    if (g_wt_on && user_data != NULL) {
+        /* ALPN never resolved: the arena attached in accept has no owner */
+        free(user_data);
+    }
     (void)engine;
     (void)conn;
-    (void)user_data;
 }
 
 static ssize_t
@@ -596,8 +661,24 @@ gw_server_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid,
     void *user_data, void *conn_proto_data)
 {
     printf("[gw] connection created scid=%s\n", xqc_scid_str(ctx.engine, cid));
-    (void)conn;
-    (void)user_data;
+
+    if (g_wt_on) {
+        /*
+         * ALPN resolved to moq-quic: --wt mode defers the MoQ session from
+         * accept() to here, when the protocol is actually known. user_data
+         * is the arena attached by accept().
+         */
+        xqc_moq_user_session_t *user_session =
+            (xqc_moq_user_session_t *)user_data;
+        if (user_session == NULL
+            || gw_moq_session_start(conn, XQC_MOQ_TRANSPORT_QUIC,
+                   user_session) == NULL)
+        {
+            printf("[gw] create session error\n");
+            return -1;
+        }
+    }
+
     (void)conn_proto_data;
     return 0;
 }
@@ -633,6 +714,146 @@ gw_server_conn_handshake_finished(xqc_connection_t *conn, void *user_data,
     (void)conn;
     (void)user_data;
     (void)conn_proto_data;
+}
+
+/* ── WebTransport callbacks (--wt: MoQ over WebTransport on ALPN h3) ─────── */
+
+static int
+gw_wt_session_request(xqc_wt_session_t *session, void *conn_user_data)
+{
+    xqc_moq_user_session_t *user_session =
+        (xqc_moq_user_session_t *)conn_user_data;
+
+    if (user_session == NULL) {
+        return -XQC_ESTATE;
+    }
+    if (user_session->session != NULL) {
+        /* one MoQ session per connection */
+        printf("[gw] second WebTransport session refused\n");
+        return -XQC_ESTATE;
+    }
+    if (xqc_wt_session_accept(session, user_session) != XQC_OK) {
+        printf("[gw] WebTransport session accept failed\n");
+        return -XQC_ESTATE;
+    }
+    printf("[gw] WebTransport session offered, accepting stream_id=%"PRIu64"\n",
+           xqc_wt_session_get_stream_id(session));
+    return XQC_OK;
+}
+
+static int
+gw_wt_session_accepted(xqc_wt_session_t *session, void *session_user_data)
+{
+    xqc_moq_user_session_t *user_session =
+        (xqc_moq_user_session_t *)session_user_data;
+
+    printf("[gw] WebTransport session established stream_id=%"PRIu64"\n",
+           xqc_wt_session_get_stream_id(session));
+
+    if (user_session == NULL
+        || gw_moq_session_start(session, XQC_MOQ_TRANSPORT_WEBTRANSPORT,
+               user_session) == NULL)
+    {
+        printf("[gw] create MoQ session over WebTransport error\n");
+        xqc_wt_session_close(session, 0, "session setup failed");
+        return -XQC_ESTATE;
+    }
+    return XQC_OK;
+}
+
+static int
+gw_wt_session_closed(xqc_wt_session_t *session, void *session_user_data)
+{
+    xqc_moq_user_session_t *user_session =
+        (xqc_moq_user_session_t *)session_user_data;
+    gw_conn_t *gw;
+
+    printf("[gw] WebTransport session closed stream_id=%"PRIu64"\n",
+           xqc_wt_session_get_stream_id(session));
+
+    if (user_session == NULL) {
+        /* refused or aborted before accept(): no MoQ session exists */
+        return XQC_OK;
+    }
+
+    gw = (gw_conn_t *)user_session->data;
+    xqc_gw_fanout_remove_session(&g_fanout, gw->moq_session);
+    gw_pump_streams();
+
+    if (user_session->session != NULL) {
+        xqc_moq_session_destroy(user_session->session);
+        user_session->session = NULL;
+    }
+    gw->moq_session = NULL;
+    gw->track_count = 0;
+    /* the arena stays until the h3 connection closes: write_socket still
+     * needs it for the other streams of the connection */
+    return XQC_OK;
+}
+
+static int
+gw_h3_conn_create_notify(xqc_h3_conn_t *h3c, const xqc_cid_t *cid,
+    void *h3c_user_data)
+{
+    xqc_wt_callbacks_t wt_cbs;
+
+    printf("[gw] h3 connection created scid=%s\n",
+           xqc_scid_str(ctx.engine, cid));
+
+    memset(&wt_cbs, 0, sizeof(wt_cbs));
+    wt_cbs.session_request_notify = gw_wt_session_request;
+    wt_cbs.session_accepted_notify = gw_wt_session_accepted;
+    wt_cbs.session_closed_notify = gw_wt_session_closed;
+    wt_cbs.stream_opened_notify = xqc_moq_wt_on_stream_opened;
+    wt_cbs.stream_read_notify = xqc_moq_wt_on_stream_read;
+    wt_cbs.stream_closed_notify = xqc_moq_wt_on_stream_closed;
+
+    if (xqc_h3_conn_set_webtransport_callbacks(h3c, &wt_cbs) != XQC_OK) {
+        printf("[gw] set webtransport callbacks failed\n");
+        return -1;
+    }
+    printf("[gw] webtransport ready on h3 connection\n");
+    (void)h3c_user_data;
+    return 0;
+}
+
+static int
+gw_h3_conn_close_notify(xqc_h3_conn_t *h3c, const xqc_cid_t *cid,
+    void *h3c_user_data)
+{
+    xqc_moq_user_session_t *user_session =
+        (xqc_moq_user_session_t *)h3c_user_data;
+    gw_conn_t *gw;
+    xqc_conn_stats_t stats;
+
+    if (user_session == NULL) {
+        return 0;
+    }
+    gw = (gw_conn_t *)user_session->data;
+    stats = xqc_conn_get_stats(ctx.engine, cid);
+
+    printf("[gw] h3 connection closed scid=%s conn_err=%d srtt=%"PRIu64
+           ", dropping %d track(s)\n",
+           xqc_scid_str(ctx.engine, cid), stats.conn_err, stats.srtt,
+           gw->track_count);
+
+    xqc_gw_fanout_remove_session(&g_fanout, gw->moq_session);
+    gw_pump_streams();
+
+    if (user_session->session != NULL) {
+        xqc_moq_session_destroy(user_session->session);
+        user_session->session = NULL;
+    }
+    free(user_session);
+    (void)h3c;
+    return 0;
+}
+
+static void
+gw_h3_conn_handshake_finished(xqc_h3_conn_t *h3c, void *h3c_user_data)
+{
+    (void)h3c;
+    (void)h3c_user_data;
 }
 
 /* ── socket + engine glue ────────────────────────────────────────────────── */
@@ -751,6 +972,66 @@ gw_stop(int signo)
     exit(0);
 }
 
+/*
+ * Print the cert's sha-256/<base64> fingerprint, the form the WebTransport
+ * browser API expects in serverCertificateHashes, and validate that the key
+ * file is readable.
+ */
+static int
+gw_print_cert_fingerprint(const char *cert_file, const char *key_file)
+{
+    FILE *fp;
+    X509 *cert;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    unsigned char b64[4 * ((EVP_MAX_MD_SIZE + 2) / 3) + 1];
+    int b64_len;
+
+    fp = fopen(cert_file, "r");
+    if (fp == NULL) {
+        printf("[gw] cannot open cert file '%s'\n", cert_file);
+        goto fail;
+    }
+    cert = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (cert == NULL) {
+        printf("[gw] cannot parse PEM certificate '%s'\n", cert_file);
+        goto fail;
+    }
+    if (X509_digest(cert, EVP_sha256(), digest, &digest_len) != 1) {
+        printf("[gw] X509_digest failed\n");
+        X509_free(cert);
+        goto fail;
+    }
+    X509_free(cert);
+
+    b64_len = EVP_EncodeBlock(b64, digest, (int)digest_len);
+    if (b64_len <= 0) {
+        printf("[gw] base64 encode failed\n");
+        goto fail;
+    }
+    b64[b64_len] = '\0';
+
+    fp = fopen(key_file, "r");
+    if (fp == NULL) {
+        printf("[gw] cannot open key file '%s'\n", key_file);
+        goto fail;
+    }
+    fclose(fp);
+
+    printf("[gw] certificate fingerprint: sha-256/%s\n", b64);
+    return 0;
+
+fail:
+    printf("[gw] --wt expects a TLS cert with a browser-trusted validity"
+           " window (<= 14 days) and an ECDSA P-256 key; generate one:\n"
+           "  openssl ecparam -name prime256v1 -genkey -noout -out %s\n"
+           "  openssl req -new -x509 -key %s -out %s -days 14"
+           " -subj '/CN=localhost'\n",
+           key_file, key_file, cert_file);
+    return -1;
+}
+
 static void
 gw_usage(void)
 {
@@ -763,8 +1044,12 @@ gw_usage(void)
            "  --stream ID    SFU stream to bridge (repeatable, required)\n"
            "  --ipc PATH     SFU Frame IPC socket (default %s)\n"
            "  --codec C      H.264 codec string (default %s)\n"
-           "  --width N --height N --fps N --bitrate BPS\n",
-           GW_DEFAULT_PORT, GW_DEFAULT_IPC_PATH, "avc1.42E01E");
+           "  --width N --height N --fps N --bitrate BPS\n"
+           "  --wt           also serve MoQ over WebTransport on ALPN h3\n"
+           "  --wt-cert FILE TLS certificate for --wt (default %s)\n"
+           "  --wt-key FILE  TLS key for --wt (default %s)\n",
+           GW_DEFAULT_PORT, GW_DEFAULT_IPC_PATH, "avc1.42E01E",
+           GW_DEFAULT_CERT_PATH, GW_DEFAULT_KEY_PATH);
 }
 
 int
@@ -786,6 +1071,9 @@ main(int argc, char *argv[])
         { "height",  required_argument, NULL, 'H' },
         { "fps",     required_argument, NULL, 'F' },
         { "bitrate", required_argument, NULL, 'B' },
+        { "wt",      no_argument,       NULL, 1001 },
+        { "wt-cert", required_argument, NULL, 1002 },
+        { "wt-key",  required_argument, NULL, 1003 },
         { NULL, 0, NULL, 0 },
     };
 
@@ -851,6 +1139,15 @@ main(int argc, char *argv[])
         case 'B':
             g_video.bitrate = strtoull(optarg, NULL, 10);
             break;
+        case 1001:
+            g_wt_on = 1;
+            break;
+        case 1002:
+            snprintf(g_cert_path, sizeof(g_cert_path), "%s", optarg);
+            break;
+        case 1003:
+            snprintf(g_key_path, sizeof(g_key_path), "%s", optarg);
+            break;
         default:
             gw_usage();
             return -1;
@@ -861,6 +1158,9 @@ main(int argc, char *argv[])
         gw_usage();
         return -1;
     }
+    if (g_wt_on && gw_print_cert_fingerprint(g_cert_path, g_key_path) != 0) {
+        return -1;
+    }
 
     memset(&ctx, 0, sizeof(ctx));
     xqc_app_open_log_file(&ctx, "./glog");
@@ -868,8 +1168,8 @@ main(int argc, char *argv[])
 
     xqc_engine_ssl_config_t engine_ssl_config;
     memset(&engine_ssl_config, 0, sizeof(engine_ssl_config));
-    engine_ssl_config.private_key_file = "./server.key";
-    engine_ssl_config.cert_file = "./server.crt";
+    engine_ssl_config.private_key_file = g_key_path;
+    engine_ssl_config.cert_file = g_cert_path;
     engine_ssl_config.ciphers = XQC_TLS_CIPHERS;
     engine_ssl_config.groups = XQC_TLS_GROUPS;
 
@@ -904,12 +1204,20 @@ main(int argc, char *argv[])
             .fec_code_rate = 0.2
         }
     };
+    if (g_wt_on) {
+        /* WebTransport datagrams carry the MoQ datachannel */
+        conn_settings.max_datagram_frame_size = 65535;
+    }
 
     xqc_config_t config;
     if (xqc_engine_get_default_config(&config, XQC_ENGINE_SERVER) < 0) {
         return -1;
     }
     config.cid_len = GW_CID_LEN;
+    if (g_wt_on) {
+        config.enable_webtransport = 1;
+        config.webtransport_max_sessions = GW_WT_MAX_SESSIONS;
+    }
     xqc_app_set_log_level(c_log_level, &config);
 
     xqc_engine_callback_t callback = {
@@ -944,6 +1252,20 @@ main(int argc, char *argv[])
         .conn_handshake_finished = gw_server_conn_handshake_finished,
     };
     xqc_moq_init_alpn(ctx.engine, &conn_cbs, XQC_MOQ_TRANSPORT_QUIC);
+
+    if (g_wt_on) {
+        xqc_h3_callbacks_t h3_cbs = {
+            .h3c_cbs = {
+                .h3_conn_create_notify = gw_h3_conn_create_notify,
+                .h3_conn_close_notify = gw_h3_conn_close_notify,
+                .h3_conn_handshake_finished = gw_h3_conn_handshake_finished,
+            },
+        };
+        if (xqc_moq_init_alpn_h3(ctx.engine, &h3_cbs) != XQC_OK) {
+            printf("[gw] register h3 ALPN error\n");
+            return -1;
+        }
+    }
 
     if (xqc_gw_fanout_init(&g_fanout, GW_FANOUT_CAP, gw_write_video_shim) != 0) {
         printf("[gw] fanout init failed\n");
@@ -981,8 +1303,9 @@ main(int argc, char *argv[])
     evtimer_add(g_ev_stats, &stats_tv);
     evtimer_add(g_ev_sub_retry, &retry_tv);
 
-    printf("[gw] listening on port %d, %d stream(s), ipc '%s'\n",
-           port, g_stream_count, g_ipc_path);
+    printf("[gw] listening on port %d, %d stream(s), ipc '%s'%s\n",
+           port, g_stream_count, g_ipc_path,
+           g_wt_on ? ", webtransport on h3" : "");
 
     event_base_dispatch(eb);
 
