@@ -2,12 +2,20 @@
 #include <xquic/xqc_http3.h>
 #include "src/http3/xqc_h3_ext_dgram.h"
 #include "src/http3/xqc_h3_conn.h"
+#include "src/http3/xqc_webtransport.h"
 
 void 
 xqc_h3_ext_datagram_read_notify(xqc_connection_t *conn,
     void *user_data, const void *data, size_t data_len, uint64_t recv_time)
 {
     xqc_h3_conn_t *h3c = (xqc_h3_conn_t*)conn->proto_data;
+
+    /* WebTransport sessions own the datagrams they are mapped to by the
+       quarter stream ID (RFC 9297 Section 2.1) */
+    if (xqc_wt_conn_on_datagram(h3c, data, data_len) == XQC_OK) {
+        return;
+    }
+
     if (h3c->h3_ext_dgram_callbacks.dgram_read_notify
         && (h3c->flags & XQC_H3_CONN_FLAG_UPPER_CONN_EXIST)) 
     {

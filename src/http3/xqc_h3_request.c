@@ -7,6 +7,7 @@
 #include "src/transport/xqc_engine.h"
 #include "src/http3/xqc_h3_conn.h"
 #include "src/http3/xqc_h3_ctx.h"
+#include "src/http3/xqc_webtransport.h"
 #include "src/http3/qpack/xqc_qpack.h"
 #include "src/common/xqc_time.h"
 
@@ -57,6 +58,13 @@ void
 xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
 {
     xqc_h3_stream_t *h3s = h3_request->h3_stream;
+
+    if (h3_request->wt_session) {
+        /* the CONNECT stream closed: terminate the WebTransport session
+           (draft-ietf-webtrans-http3-07 Section 5) and free it */
+        xqc_wt_session_on_request_closed(h3_request->wt_session);
+        h3_request->wt_session = NULL;
+    }
 
     /* print request statistic log */
     xqc_request_stats_t stats = xqc_h3_request_get_stats(h3_request);
@@ -802,6 +810,22 @@ xqc_h3_request_recv_body(xqc_h3_request_t *h3_request, unsigned char *recv_buf,
     return n_recv;
 }
 
+static xqc_bool_t
+xqc_h3_req_field_name_is(const xqc_http_header_t *hdr, const char *name,
+    size_t name_len)
+{
+    return hdr->name.iov_len == name_len
+           && memcmp(hdr->name.iov_base, name, name_len) == 0;
+}
+
+static xqc_bool_t
+xqc_h3_req_field_value_is(const xqc_http_header_t *hdr, const char *value,
+    size_t value_len)
+{
+    return hdr->value.iov_len == value_len
+           && memcmp(hdr->value.iov_base, value, value_len) == 0;
+}
+
 xqc_int_t
 xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
 {
@@ -906,6 +930,140 @@ xqc_h3_request_on_recv_header(xqc_h3_request_t *h3r)
                     h3r->h3_stream->h3c->conn, h3r->h3_stream->stream_id,
                     i, hdr->name.iov_len);
             return -XQC_H3_EMALFORMED_HEADER;
+        }
+    }
+
+    /*
+     * Extended CONNECT admission (RFC 8441 Section 4, RFC 9220 Section 3;
+     * WebTransport token rules in draft-ietf-webtrans-http3-07 Section 3.3).
+     * Only the leading header section may carry :protocol.
+     */
+    if (h3r->completed_header_count == 0) {
+        xqc_bool_t protocol_seen = XQC_FALSE;
+        xqc_bool_t protocol_dup = XQC_FALSE;
+        xqc_bool_t wt_token = XQC_FALSE;
+        xqc_bool_t method_is_connect = XQC_FALSE;
+        xqc_bool_t scheme_seen = XQC_FALSE;
+        xqc_bool_t scheme_is_https = XQC_FALSE;
+        xqc_bool_t path_seen = XQC_FALSE;
+        xqc_bool_t authority_seen = XQC_FALSE;
+        const unsigned char *origin = NULL;
+        size_t origin_len = 0;
+
+        for (size_t i = 0; i < headers->count; i++) {
+            xqc_http_header_t *hdr = &headers->headers[i];
+
+            if (xqc_h3_req_field_name_is(hdr, ":protocol", 9)) {
+                if (protocol_seen) {
+                    protocol_dup = XQC_TRUE;
+                }
+                protocol_seen = XQC_TRUE;
+                wt_token = xqc_h3_req_field_value_is(hdr, "webtransport", 12);
+
+            } else if (xqc_h3_req_field_name_is(hdr, ":method", 7)) {
+                method_is_connect = xqc_h3_req_field_value_is(hdr, "CONNECT", 7);
+
+            } else if (xqc_h3_req_field_name_is(hdr, ":scheme", 7)) {
+                scheme_seen = XQC_TRUE;
+                scheme_is_https = xqc_h3_req_field_value_is(hdr, "https", 5);
+
+            } else if (xqc_h3_req_field_name_is(hdr, ":path", 5)) {
+                path_seen = XQC_TRUE;
+
+            } else if (xqc_h3_req_field_name_is(hdr, ":authority", 10)) {
+                authority_seen = XQC_TRUE;
+
+            } else if (xqc_h3_req_field_name_is(hdr, "origin", 6)) {
+                origin = hdr->value.iov_base;
+                origin_len = hdr->value.iov_len;
+            }
+        }
+
+        if (protocol_seen) {
+            xqc_h3_conn_t *h3c = h3r->h3_stream->h3c;
+
+            if (h3c->local_h3_conn_settings.enable_connect_protocol != 1) {
+                xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                        "|:protocol without local SETTINGS_ENABLE_CONNECT_PROTOCOL|"
+                        "conn:%p|stream_id:%ui|", h3c->conn,
+                        h3r->h3_stream->stream_id);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
+            if (protocol_dup) {
+                xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                        "|duplicated :protocol pseudo-header|conn:%p|stream_id:%ui|",
+                        h3c->conn, h3r->h3_stream->stream_id);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
+            if (!method_is_connect) {
+                xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                        "|:protocol without CONNECT method|conn:%p|stream_id:%ui|",
+                        h3c->conn, h3r->h3_stream->stream_id);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
+            if (!scheme_seen || !path_seen) {
+                xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                        "|extended CONNECT missing :scheme or :path|conn:%p|"
+                        "stream_id:%ui|scheme:%ud|path:%ud|", h3c->conn,
+                        h3r->h3_stream->stream_id, scheme_seen, path_seen);
+                return -XQC_H3_EMALFORMED_HEADER;
+            }
+
+            if (wt_token) {
+                if (!scheme_is_https) {
+                    xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                            "|webtransport request with non-https :scheme|conn:%p|"
+                            "stream_id:%ui|", h3c->conn, h3r->h3_stream->stream_id);
+                    return -XQC_H3_EMALFORMED_HEADER;
+                }
+
+                if (!authority_seen) {
+                    xqc_log(h3r->h3_stream->log, XQC_LOG_ERROR,
+                            "|webtransport request missing :authority|conn:%p|"
+                            "stream_id:%ui|", h3c->conn, h3r->h3_stream->stream_id);
+                    return -XQC_H3_EMALFORMED_HEADER;
+                }
+
+                h3r->wt_flags |= XQC_H3_WT_REQ_FLAG_EXT_CONNECT
+                                 | XQC_H3_WT_REQ_FLAG_WEBTRANSPORT;
+
+                if (origin) {
+                    xqc_log(h3r->h3_stream->log, XQC_LOG_INFO,
+                            "|webtransport request|conn:%p|stream_id:%ui|"
+                            "origin:%*s|", h3c->conn, h3r->h3_stream->stream_id,
+                            (int)origin_len, (const char *)origin);
+
+                } else {
+                    xqc_log(h3r->h3_stream->log, XQC_LOG_INFO,
+                            "|webtransport request without origin|conn:%p|"
+                            "stream_id:%ui|", h3c->conn, h3r->h3_stream->stream_id);
+                }
+
+                /* offer the request to the WebTransport session layer */
+                xqc_wt_conn_on_request(h3c, h3r);
+                if (h3r->wt_flags & XQC_H3_WT_REQ_FLAG_INTERNAL_RESET) {
+                    /*
+                     * the WT layer is not willing to process this request
+                     * (session limit, draft-07 Section 3.4): the CONNECT
+                     * stream has been reset and the request is not exposed
+                     */
+                    h3r->read_flag |= hdr_type_2_flag[h3r->completed_header_count];
+                    h3r->header_recvd += headers->total_len;
+                    h3r->completed_header_count++;
+                    return XQC_OK;
+                }
+
+            } else {
+                h3r->wt_flags |= XQC_H3_WT_REQ_FLAG_EXT_CONNECT
+                                 | XQC_H3_WT_REQ_FLAG_PROTOCOL_UNKNOWN;
+
+                xqc_log(h3r->h3_stream->log, XQC_LOG_INFO,
+                        "|unsupported extended CONNECT protocol|conn:%p|"
+                        "stream_id:%ui|", h3c->conn, h3r->h3_stream->stream_id);
+            }
         }
     }
 

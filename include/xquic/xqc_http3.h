@@ -279,6 +279,18 @@ typedef struct xqc_h3_conn_settings_s {
     /** MAX_BLOCKED_STREAMS */
     uint64_t qpack_blocked_streams;
 
+    /** SETTINGS_ENABLE_CONNECT_PROTOCOL, 0 or 1 (RFC 9220 Section 3) */
+    uint64_t enable_connect_protocol;
+
+    /** SETTINGS_H3_DATAGRAM, 0 or 1 (RFC 9297 Section 2.1.1) */
+    uint64_t h3_datagram;
+
+    /**
+     * SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-07
+     * Section 8.2); 0 means WebTransport disabled
+     */
+    uint64_t webtransport_max_sessions;
+
 #ifdef XQC_COMPAT_DUPLICATE
     /** compat with the original qpack encoder's duplicate strategy */
     xqc_bool_t  qpack_compat_duplicate;

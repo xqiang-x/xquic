@@ -404,6 +404,20 @@ static void
 xqc_moq_media_on_destroy(xqc_moq_track_t *track)
 {
     xqc_moq_media_track_t *media_track = (xqc_moq_media_track_t*)track;
+    xqc_list_head_t *pos, *next;
+    xqc_moq_stream_t *stream;
+
+    /*
+     * release the streams still writing for this track: over WebTransport
+     * their transport streams outlive the session, so nothing else would
+     * ever free them
+     */
+    xqc_list_for_each_safe(pos, next, &media_track->write_stream_list) {
+        stream = xqc_list_entry(pos, xqc_moq_stream_t, list_member);
+        xqc_list_del_init(&stream->list_member);
+        xqc_moq_stream_destroy(stream);
+    }
+
     if (media_track->dejitter != NULL) {
         xqc_moq_av_dejitter_destroy(media_track->dejitter);
     }

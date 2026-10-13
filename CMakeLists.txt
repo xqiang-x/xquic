@@ -20,6 +20,7 @@ option (XQC_ENABLE_XOR "enable fec scheme xor" OFF)
 option (XQC_ENABLE_RSC "enable fec scheme reed-solomon code" OFF)
 option (XQC_ENABLE_PKM "enable fec scheme packet mask" OFF)
 option (XQC_PING_ATTACK_PROTECT "enable ping attack protection" OFF)
+option (XQC_ENABLE_MOQ "enable moq support" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -217,6 +218,7 @@ set(
     "src/http3/qpack/dtable/xqc_dtable.c"
     "src/http3/xqc_h3_ext_dgram.c"
     "src/http3/xqc_h3_ext_bytestream.c"
+    "src/http3/xqc_webtransport.c"
 )
 
 # Transport source

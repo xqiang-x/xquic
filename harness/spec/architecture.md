@@ -53,6 +53,14 @@ core transport          QUIC Transport, Recovery, QUIC DATAGRAM, Multipath
 network                 UDP/IP
 ```
 
+MoQ executables follow one topology: publisher executables (`moq_demo_server`,
+`moq_gateway`) advertise tracks through the catalog that `moq_demo_client`
+subscribes to. The `moq_gateway` relay republishes frames assembled by an
+external media server received over a Unix-domain-socket Frame IPC; it carries
+an independent copy of that wire contract in
+`moq/demo/xqc_moq_gateway_frame_ipc.h` and locks it with contract unit tests
+(see ADR-H008).
+
 These views describe protocol relationships, not compile-time dependency
 direction. The published standards below map only to capabilities represented
 in the repository; they do not imply support for every RFC produced by the

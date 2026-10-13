@@ -104,6 +104,10 @@ typedef struct xqc_h3_conn_s {
 
     /* blocked buffer monitoring */
     size_t                       total_blocked_buf_size;           /* current total blocked buffer size */
+
+    /* WebTransport session layer, allocated when the engine enables
+       WebTransport (xqc_config_t.enable_webtransport) */
+    struct xqc_wt_conn_s        *wt;
 } xqc_h3_conn_t;
 
 

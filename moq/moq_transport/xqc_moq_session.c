@@ -1,6 +1,8 @@
 #include "src/transport/xqc_engine.h"
 #include "src/transport/xqc_conn.h"
 #include "src/transport/xqc_send_ctl.h"
+#include "xquic/xqc_http3.h"
+#include "xquic/xqc_webtransport.h"
 #include "moq/moq_transport/xqc_moq_session.h"
 #include "moq/moq_transport/xqc_moq_message_writer.h"
 #include "moq/moq_transport/xqc_moq_stream.h"
@@ -20,6 +22,25 @@ xqc_moq_init_alpn(xqc_engine_t *engine, xqc_conn_callbacks_t *conn_cbs, xqc_moq_
         };
         xqc_engine_register_alpn(engine, XQC_ALPN_MOQ_QUIC, sizeof(XQC_ALPN_MOQ_QUIC) - 1, &ap_cbs, NULL);
     }
+}
+
+xqc_int_t
+xqc_moq_init_alpn_h3(xqc_engine_t *engine, xqc_h3_callbacks_t *h3_cbs)
+{
+    if (engine == NULL || h3_cbs == NULL || h3_cbs->h3c_cbs.h3_conn_create_notify == NULL) {
+        return -XQC_EPARAM;
+    }
+
+    if (!engine->config->enable_webtransport) {
+        return -XQC_ESTATE;
+    }
+
+    /*
+     * registers the "h3" ALPN and the HTTP/3 context: the application then
+     * registers xqc_wt_callbacks_t in its own h3_conn_create_notify, routing
+     * the MoQ WebTransport stream callbacks to xqc_moq_wt_on_stream_*().
+     */
+    return xqc_h3_ctx_init(engine, h3_cbs);
 }
 
 xqc_moq_session_t *
@@ -42,12 +63,15 @@ xqc_moq_session_create(void *conn, xqc_moq_user_session_t *user_session, xqc_moq
             quic_conn = (xqc_connection_t *)conn;
             break;
         }
-        /*case XQC_MOQ_TRANSPORT_WEBTRANSPORT: {
-            //TODO: WEBTRANSPORT
-            wt_conn = (xqc_wt_t *)conn;
-            quic_conn = wt_conn->conn;
+        case XQC_MOQ_TRANSPORT_WEBTRANSPORT: {
+            /* the session runs on the QUIC connection under the accepted
+             * WebTransport session */
+            quic_conn = xqc_wt_session_get_quic_conn((xqc_wt_session_t *)conn);
+            if (quic_conn == NULL) {
+                goto error;
+            }
             break;
-        }*/
+        }
         default: {
             goto error;
         }
@@ -58,6 +82,16 @@ xqc_moq_session_create(void *conn, xqc_moq_user_session_t *user_session, xqc_moq
     session->log = quic_conn->log;
     session->timer_manager = &quic_conn->conn_timer_manager;
     session->enable_fec = quic_conn->conn_settings.enable_encode_fec;
+
+    /* WebTransport requires the h3 CONNECT handshake, which only exists on
+     * the server side of this implementation */
+    if (transport_type == XQC_MOQ_TRANSPORT_WEBTRANSPORT
+        && session->engine->eng_type != XQC_ENGINE_SERVER)
+    {
+        xqc_log(session->log, XQC_LOG_ERROR,
+                "|webtransport moq session must run on a server engine|");
+        goto error;
+    }
 
     user_session->session = session;
 
@@ -115,6 +149,25 @@ xqc_moq_session_destroy(xqc_moq_session_t *session)
     xqc_moq_track_t *track;
 
     xqc_log(session->log, XQC_LOG_INFO, "|session destroy begin|");
+
+    if (session->transport_type == XQC_MOQ_TRANSPORT_WEBTRANSPORT) {
+        /*
+         * WebTransport control and ordered streams whose transport streams
+         * outlive the session are released here. The fields are cleared
+         * first so xqc_moq_stream_destroy() does not run the abrupt-close
+         * error path for the session being destroyed.
+         */
+        if (session->ctl_stream != NULL) {
+            xqc_moq_stream_t *ctl_stream = session->ctl_stream;
+            session->ctl_stream = NULL;
+            xqc_moq_stream_destroy(ctl_stream);
+        }
+        if (session->datachannel.ordered_stream != NULL) {
+            xqc_moq_stream_t *ordered = session->datachannel.ordered_stream;
+            session->datachannel.ordered_stream = NULL;
+            xqc_moq_stream_destroy(ordered);
+        }
+    }
 
     xqc_list_for_each_safe(pos, next, &session->local_subscribe_list) {
         subscribe = xqc_list_entry(pos, xqc_moq_subscribe_t, list_member);

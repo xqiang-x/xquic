@@ -35,6 +35,11 @@ extern const char *const xqc_h3_alpn[];
 
 #define XQC_H3_MAX_BUFFER_COUNT_SIZE        (100)
 
+/* default SETTINGS_WEBTRANSPORT_MAX_SESSIONS advertised when WebTransport
+ * is enabled without an explicit limit
+ * (draft-ietf-webtrans-http3-07 Section 3.4) */
+#define XQC_H3_WT_DEFAULT_MAX_SESSIONS      (16)
+
 /* setting options */
 typedef enum {
     /* h3 settings */
@@ -43,6 +48,31 @@ typedef enum {
     /* QPACK settings */
     XQC_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY    = 0x01,
     XQC_H3_SETTINGS_QPACK_BLOCKED_STREAMS       = 0x07,
+
+    /* extended CONNECT (RFC 9220 Section 3, RFC 8441 Section 4) */
+    XQC_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL     = 0x08,
+
+    /* HTTP/3 datagrams (RFC 9297 Section 2.1.1) */
+    XQC_H3_SETTINGS_H3_DATAGRAM                 = 0x33,
+
+    /*
+     * WebTransport draft-02 enable flag
+     * (draft-ietf-webtrans-http3-02 Section 3; quiche
+     * SETTINGS_WEBTRANS_DRAFT00). Chrome advertises draft-07 support only
+     * behind a flag and falls back to draft-02, so a server that wants
+     * stock clients to connect has to advertise both.
+     */
+    XQC_H3_SETTINGS_WEBTRANSPORT_DRAFT00        = 0x2b603742,
+
+    /*
+     * pre-RFC HTTP/3 datagrams (draft-ietf-masque-h3-datagram-04; quiche
+     * SETTINGS_H3_DATAGRAM_DRAFT04), negotiated by draft-02 WebTransport
+     * peers. Same on-wire datagram framing as RFC 9297.
+     */
+    XQC_H3_SETTINGS_H3_DATAGRAM_DRAFT04         = 0xffd277,
+
+    /* WebTransport (draft-ietf-webtrans-http3-07 Section 8.2) */
+    XQC_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS   = 0xc671706a,
 
     /* HTTP/2-only settings reserved by RFC 9114 Section 7.2.4.1 */
     XQC_H3_SETTINGS_H2_ENABLE_PUSH               = 0x02,

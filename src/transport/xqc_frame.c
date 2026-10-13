@@ -1758,13 +1758,17 @@ xqc_process_datagram_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     }
 
     /* @TODO: datagram read callback */
-    if (data_len > 0) {
-        if (conn->app_proto_cbs.dgram_cbs.datagram_read_notify
-            && (conn->conn_flag & XQC_CONN_FLAG_UPPER_CONN_EXIST))
-        {
-            conn->app_proto_cbs.dgram_cbs.datagram_read_notify(conn, conn->dgram_data, data_buffer, data_len, xqc_monotonic_timestamp() - packet_in->pkt_recv_time);
-            xqc_log(conn->log, XQC_LOG_DEBUG, "|xqc_datagram_read|data_len:%z|", data_len);
-        }
+    if (conn->app_proto_cbs.dgram_cbs.datagram_read_notify
+        && (conn->conn_flag & XQC_CONN_FLAG_UPPER_CONN_EXIST))
+    {
+        /*
+         * RFC 9297 Section 2.1: an empty payload is still delivered upward;
+         * a payload too short to carry the quarter stream ID is a connection
+         * error of type H3_DATAGRAM_ERROR, which only the HTTP/3 layer can
+         * detect
+         */
+        conn->app_proto_cbs.dgram_cbs.datagram_read_notify(conn, conn->dgram_data, data_buffer, data_len, xqc_monotonic_timestamp() - packet_in->pkt_recv_time);
+        xqc_log(conn->log, XQC_LOG_DEBUG, "|xqc_datagram_read|data_len:%z|", data_len);
     }
 
     return ret;

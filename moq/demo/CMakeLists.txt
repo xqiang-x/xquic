@@ -16,6 +16,14 @@ set(
     "xqc_moq_demo_comm.c"
 )
 
+set(
+    MOQ_GATEWAY_SOURCE
+    "xqc_moq_gateway.c"
+    "xqc_moq_gateway_feed.c"
+    "xqc_moq_gateway_ipc.c"
+    "xqc_moq_demo_comm.c"
+)
+
 
 include_directories(
     "${CMAKE_SOURCE_DIR}/"
@@ -50,3 +58,10 @@ add_executable(moq_demo_audio_server ${MOQ_DEMO_AUDIO_SERVER_SOURCE})
 target_link_libraries(moq_demo_client ${APP_DEPEND_LIBS})
 target_link_libraries(moq_demo_server ${APP_DEPEND_LIBS})
 target_link_libraries(moq_demo_audio_server ${APP_DEPEND_LIBS})
+
+if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+    message(STATUS "moq_gateway skipped: needs POSIX domain sockets")
+else()
+    add_executable(moq_gateway ${MOQ_GATEWAY_SOURCE})
+    target_link_libraries(moq_gateway ${APP_DEPEND_LIBS})
+endif()

@@ -99,6 +99,7 @@ if(HAVE_CUNIT)
         ${UNIT_TEST_DIR}/xqc_tls_test.c
         ${UNIT_TEST_DIR}/xqc_crypto_test.c
         ${UNIT_TEST_DIR}/xqc_h3_test.c
+        ${UNIT_TEST_DIR}/xqc_webtransport_test.c
         ${UNIT_TEST_DIR}/xqc_hq_test.c
         ${CMAKE_SOURCE_DIR}/demo/xqc_hq_request.c
         ${UNIT_TEST_DIR}/xqc_stable_test.c
@@ -133,6 +134,18 @@ if(HAVE_CUNIT)
         )
     endif()
 
+    set(MOQ_TEST_DEPEND_LIBS "")
+    if(XQC_ENABLE_MOQ AND NOT (${CMAKE_SYSTEM_NAME} MATCHES "Windows"))
+        set(
+            test_SOURCES
+            ${test_SOURCES}
+            ${UNIT_TEST_DIR}/xqc_moq_gateway_test.c
+            ${CMAKE_SOURCE_DIR}/moq/demo/xqc_moq_gateway_feed.c
+            ${CMAKE_SOURCE_DIR}/moq/demo/xqc_moq_gateway_ipc.c
+        )
+        set(MOQ_TEST_DEPEND_LIBS ${LIBEVENT_LIBRARY})
+    endif()
+
     add_executable(run_tests
         ${test_SOURCES}
     )
@@ -163,6 +176,7 @@ if(HAVE_CUNIT)
     
     target_link_libraries(run_tests
         ${CUTEST_DEPEND_LIBS}
+        ${MOQ_TEST_DEPEND_LIBS}
     )
 
     add_test(NAME run_tests COMMAND run_tests)

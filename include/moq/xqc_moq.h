@@ -2,6 +2,7 @@
 #define _XQC_MOQ_H_INCLUDED_
 
 #include <xquic/xquic.h>
+#include <xquic/xqc_http3.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -245,6 +246,25 @@ typedef struct {
 
 XQC_EXPORT_PUBLIC_API
 void xqc_moq_init_alpn(xqc_engine_t *engine, xqc_conn_callbacks_t *conn_cbs, xqc_moq_transport_type_t transport_type);
+
+/**
+ * @brief Initialize the "h3" ALPN and HTTP/3 context for serving MoQ over
+ *        WebTransport (engine config enable_webtransport must be set).
+ *
+ * After this call the engine serves HTTP/3; the application registers
+ * xqc_wt_callbacks_t in its own h3_conn_create_notify and routes the stream
+ * callbacks to xqc_moq_wt_on_stream_opened/read/closed (declared in
+ * moq/moq_transport/xqc_moq_stream_webtransport.h). The MoQ session itself
+ * is then created with xqc_moq_session_create() using the accepted
+ * xqc_wt_session_t as the conn argument and XQC_MOQ_TRANSPORT_WEBTRANSPORT.
+ *
+ * @param engine the engine handler
+ * @param h3_cbs HTTP/3 callbacks (h3_conn_create_notify is required)
+ * @return XQC_OK for success, -XQC_EPARAM for wrong parameters,
+ *         -XQC_ESTATE when enable_webtransport is not set on the engine
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t xqc_moq_init_alpn_h3(xqc_engine_t *engine, xqc_h3_callbacks_t *h3_cbs);
 
 /**
  * @param extdata The client can send extdata when creating a session. 

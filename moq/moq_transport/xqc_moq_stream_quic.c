@@ -103,6 +103,11 @@ xqc_moq_quic_stream_close_notify(xqc_stream_t *stream, void *user_data)
 {
     xqc_moq_stream_t *moq_stream = (xqc_moq_stream_t*)user_data;
 
+    if (moq_stream == NULL) {
+        /* the moq stream was already released and detached */
+        return XQC_OK;
+    }
+
     xqc_moq_stream_destroy(moq_stream);
     return XQC_OK;
 }

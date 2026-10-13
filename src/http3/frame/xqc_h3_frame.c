@@ -470,6 +470,52 @@ xqc_h3_frm_write_settings(xqc_list_head_t *send_buf, xqc_h3_conn_settings_t *set
     len += xqc_put_varint_len(settings[count].value.vi);
     ++count;
 
+    if (setting->webtransport_max_sessions > 0) {
+        /*
+         * draft-ietf-webtrans-http3-07 Sections 3.1/3.2: an endpoint
+         * supporting WebTransport sends MAX_SESSIONS > 0, and a server
+         * additionally sends SETTINGS_ENABLE_CONNECT_PROTOCOL = 1;
+         * both endpoints send SETTINGS_H3_DATAGRAM = 1 (Section 3.1,
+         * RFC 9297 Section 2.1.1).
+         *
+         * The draft-02 enable flag and the draft-04 datagram setting are
+         * advertised along with the draft-07 entries (quiche
+         * FillSettingsFrame does the same for kRfcAndDraft04): Chrome
+         * only advertises draft-07 behind the EnableWebTransportDraft07
+         * feature and otherwise negotiates draft-02, which requires
+         * SETTINGS_WEBTRANS_DRAFT00 and SETTINGS_H3_DATAGRAM_DRAFT04.
+         */
+        settings[count].identifier.vi = XQC_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+        settings[count].value.vi = 1;
+        len += xqc_put_varint_len(settings[count].identifier.vi);
+        len += xqc_put_varint_len(settings[count].value.vi);
+        ++count;
+
+        settings[count].identifier.vi = XQC_H3_SETTINGS_H3_DATAGRAM;
+        settings[count].value.vi = 1;
+        len += xqc_put_varint_len(settings[count].identifier.vi);
+        len += xqc_put_varint_len(settings[count].value.vi);
+        ++count;
+
+        settings[count].identifier.vi = XQC_H3_SETTINGS_H3_DATAGRAM_DRAFT04;
+        settings[count].value.vi = 1;
+        len += xqc_put_varint_len(settings[count].identifier.vi);
+        len += xqc_put_varint_len(settings[count].value.vi);
+        ++count;
+
+        settings[count].identifier.vi = XQC_H3_SETTINGS_WEBTRANSPORT_DRAFT00;
+        settings[count].value.vi = 1;
+        len += xqc_put_varint_len(settings[count].identifier.vi);
+        len += xqc_put_varint_len(settings[count].value.vi);
+        ++count;
+
+        settings[count].identifier.vi = XQC_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS;
+        settings[count].value.vi = setting->webtransport_max_sessions;
+        len += xqc_put_varint_len(settings[count].identifier.vi);
+        len += xqc_put_varint_len(settings[count].value.vi);
+        ++count;
+    }
+
     xqc_var_buf_t *buf = xqc_var_buf_create(xqc_put_varint_len(XQC_H3_FRM_SETTINGS)
                                             + xqc_put_varint_len(len)
                                             + len);
